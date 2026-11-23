@@ -1,0 +1,15 @@
+{
+  "C_Cpp.default.includePath": ["${workspaceFolder}/bpf"],
+  "C_Cpp.default.browse.path": ["${workspaceFolder}/bpf"],
+  "C_Cpp.files.exclude": {
+    "**/.terraform": true,
+    "terraform": true,
+    ".trail": true,
+    ".claude": true,
+    "**/.git": true
+  },
+  "files.watcherExclude": {
+    "**/.terraform/**": true,
+    "terraform/**": true
+  }
+}
