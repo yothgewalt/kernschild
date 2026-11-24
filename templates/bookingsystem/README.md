@@ -14,7 +14,7 @@ The payment provider is a mock.
 
 | App | Language | Port | Role |
 |---|---|---|---|
-| `apps/booking-service` | Node.js | HTTP 3000 | Public HTTP API and orchestrator |
+| `apps/booking-service` | TypeScript (Node.js, no build step) | HTTP 3000 | Public HTTP API and orchestrator |
 | `apps/auth-service` | Go | gRPC 50051 | Users, login, JWT validation |
 | `apps/event-service` | Go | gRPC 50052 | Events and seat inventory. Holds live in Redis; events and sales in Postgres |
 | `apps/payment-service` | Python | gRPC 50053 | Mock payment worker (RabbitMQ consumer) and payment lookup |
@@ -69,7 +69,8 @@ Run `task` to list all commands. To change the protos, edit them under `proto/` 
 | GET | `/stats` | Bookings by status, plus every event's inventory |
 | GET | `/healthz` | |
 
-Send `Authorization: Bearer <token>` on routes that require auth. You can watch the queues
+Send `Authorization: Bearer <token>` on routes that require auth. Responses over 1 KiB are
+compressed (gzip, br or deflate) when the request's `Accept-Encoding` allows it. You can watch the queues
 in the RabbitMQ UI at http://localhost:15672 (`guest`/`guest`).
 
 ## How a burst stays correct

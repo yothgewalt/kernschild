@@ -1,6 +1,7 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import pg from 'pg';
+import { gunzipSync } from 'node:zlib';
 import type { FastifyInstance } from 'fastify';
 import { createDb } from '../src/db.ts';
 import type { Db } from '../src/db.ts';
@@ -82,7 +83,7 @@ beforeEach(async () => {
   };
   const mq = { publish: async <K extends keyof Outbox>(key: K, body: Outbox[K]) => { if (behavior.publish) throw behavior.publish; published.push([key, body]); } };
   bookings = createBookings({ db, grpc, mq });
-  app = buildApp({ grpc, db, bookings, healthy: async () => true });
+  app = await buildApp({ grpc, db, bookings, healthy: async () => true });
 });
 
 const post = (payload: object, token: string | null = 'good', key?: string) => app.inject({
@@ -181,6 +182,20 @@ test('sweeper expires overdue PENDING bookings and releases', async () => {
 
 test('GET /events renders int64 as number', async () => {
   assert.equal((await app.inject('/events')).json<Body>().events[0]?.price_cents, 150000);
+});
+
+test('large responses are gzipped when the client accepts it, small ones are not', async () => {
+  const one = { id: EVENT, name: 'a fairly long event name for padding', capacity: 100, available: 100, held: 0, sold: 0, price_cents: '150000', created_at: '2026-11-24T00:00:00Z' };
+  behavior.ListEvents = () => ({ events: Array.from({ length: 30 }, () => one) });
+  const big = await app.inject({ url: '/events', headers: { 'accept-encoding': 'gzip' } });
+  assert.equal(big.headers['content-encoding'], 'gzip');
+  const body: Body = JSON.parse(gunzipSync(big.rawPayload).toString());
+  assert.equal(body.events.length, 30);
+  assert.equal(body.events[0]?.price_cents, 150000);
+  const plain = await app.inject({ url: '/events' });
+  assert.equal(plain.headers['content-encoding'], undefined); // no Accept-Encoding, no compression
+  const small = await app.inject({ url: '/healthz', headers: { 'accept-encoding': 'gzip' } });
+  assert.equal(small.headers['content-encoding'], undefined); // under the 1 KiB threshold
 });
 
 test('SUCCEEDED + FAILED_PRECONDITION -> EXPIRED and refund hold_expired', async () => {

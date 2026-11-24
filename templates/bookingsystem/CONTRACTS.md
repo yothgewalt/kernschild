@@ -313,8 +313,8 @@ HTTP API (JSON; error bodies are `{"error": "<snake_case>", "message": "..."}`):
 
 Booking JSON uses snake_case fields that mirror the table columns. Proto enums are rendered as
 strings without their prefix: `PAYMENT_STATUS_SUCCEEDED` → `"SUCCEEDED"`. Every gRPC call has
-a deadline of 5s and `waitForReady`. Clients re-resolve DNS after 1s and cap reconnect backoff at 2s,
-so a recreated peer with a new IP is reachable again within seconds.
+a deadline of 5s and fails fast (UNAVAILABLE, mapped to 503) while a peer is down. Clients re-resolve DNS after
+1s and cap reconnect backoff at 2s, so a recreated peer with a new IP is reachable again within seconds.
 
 ## Repository layout
 

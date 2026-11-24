@@ -29,7 +29,7 @@ const bookings = createBookings({ db, grpc, mq });
 await mq.consume((msg) => bookings.onResult(msg));
 
 const sweeper = setInterval(() => bookings.sweep().catch((e: unknown) => log('sweep error', errorMessage(e))), config.sweepMs);
-const app = buildApp({ grpc, db, bookings, healthy: async () => { await db.ping(); return mq.isOpen(); } });
+const app = await buildApp({ grpc, db, bookings, healthy: async () => { await db.ping(); return mq.isOpen(); } });
 await app.listen({ port: config.port, host: '0.0.0.0' });
 log(`booking listening on :${config.port}`);
 

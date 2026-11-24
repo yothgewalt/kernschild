@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import compress from '@fastify/compress';
 import type { FastifyError, FastifyReply, FastifyRequest } from 'fastify';
 import { code, grpcCode } from './grpc.ts';
 import type { Clients, GrpcStatus } from './grpc.ts';
@@ -54,9 +55,11 @@ const uuid = { type: 'string', format: 'uuid' };
 
 const unauthenticated = () => Object.assign(new Error('missing bearer token'), { code: code.UNAUTHENTICATED });
 
-export function buildApp({ grpc, db, bookings, healthy }: { grpc: Clients; db: Db; bookings: Bookings; healthy: () => Promise<boolean> }) {
+export async function buildApp({ grpc, db, bookings, healthy }: { grpc: Clients; db: Db; bookings: Bookings; healthy: () => Promise<boolean> }) {
   const app = Fastify({ logger: false });
   app.setErrorHandler(onError);
+  // gzip/br/deflate per Accept-Encoding for bodies over 1 KiB; awaited so the hook covers every route below.
+  await app.register(compress, { threshold: 1024 });
 
   const authenticate = async (req: FastifyRequest) => {
     const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? '');
