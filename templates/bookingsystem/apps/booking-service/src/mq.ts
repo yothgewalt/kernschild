@@ -1,10 +1,13 @@
 import amqp from 'amqplib';
+import { errorMessage } from './types.ts';
+import type { Outbox } from './types.ts';
 
 const EXCHANGE = 'bookings';
+export type Mq = Awaited<ReturnType<typeof connectMq>>;
 export const RESULTS_QUEUE = 'booking.payment-results';
 
 // Connects, declares the shared topology, returns { publish, consume, isOpen, close }.
-export async function connectMq(url, onClose) {
+export async function connectMq(url: string, onClose?: () => void) {
   const conn = await amqp.connect(url);
   conn.on('error', () => {});
   conn.on('close', () => onClose?.());
@@ -22,19 +25,19 @@ export async function connectMq(url, onClose) {
   conn.on('close', () => { open = false; });
   return {
     isOpen: () => open,
-    publish: (key, body) => new Promise((resolve, reject) =>
+    publish: <K extends keyof Outbox>(key: K, body: Outbox[K]) => new Promise<void>((resolve, reject) =>
       pub.publish(EXCHANGE, key, Buffer.from(JSON.stringify(body)), { persistent: true, contentType: 'application/json' },
         (err) => (err ? reject(err) : resolve()))),
     // handler(body) resolves 'ack' | 'requeue'; unparsable or throwing messages are dropped.
-    async consume(handler) {
+    async consume(handler: (body: unknown) => Promise<'ack' | 'requeue'>) {
       const ch = await conn.createChannel();
       ch.on('error', () => {});
       ch.on('close', () => onClose?.());
       await ch.prefetch(20);
       await ch.consume(RESULTS_QUEUE, async (msg) => {
         if (!msg) return;
-        let verdict = 'drop';
-        try { verdict = await handler(JSON.parse(msg.content.toString())); } catch (e) { console.error('result handler error', e.message); }
+        let verdict: 'ack' | 'requeue' | 'drop' = 'drop';
+        try { verdict = await handler(JSON.parse(msg.content.toString())); } catch (e) { console.error('result handler error', errorMessage(e)); }
         if (verdict === 'ack') ch.ack(msg);
         else if (verdict === 'requeue') { await new Promise((r) => setTimeout(r, 1000)); ch.nack(msg, false, true); }
         else ch.nack(msg, false, false);

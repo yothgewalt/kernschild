@@ -1,0 +1,23 @@
+// Original file: proto/bookingsystem/payment/v1/payment.proto
+
+export const PaymentStatus = {
+  PAYMENT_STATUS_UNSPECIFIED: 'PAYMENT_STATUS_UNSPECIFIED',
+  PAYMENT_STATUS_PROCESSING: 'PAYMENT_STATUS_PROCESSING',
+  PAYMENT_STATUS_SUCCEEDED: 'PAYMENT_STATUS_SUCCEEDED',
+  PAYMENT_STATUS_FAILED: 'PAYMENT_STATUS_FAILED',
+  PAYMENT_STATUS_REFUNDED: 'PAYMENT_STATUS_REFUNDED',
+} as const;
+
+export type PaymentStatus =
+  | 'PAYMENT_STATUS_UNSPECIFIED'
+  | 0
+  | 'PAYMENT_STATUS_PROCESSING'
+  | 1
+  | 'PAYMENT_STATUS_SUCCEEDED'
+  | 2
+  | 'PAYMENT_STATUS_FAILED'
+  | 3
+  | 'PAYMENT_STATUS_REFUNDED'
+  | 4
+
+export type PaymentStatus__Output = typeof PaymentStatus[keyof typeof PaymentStatus]

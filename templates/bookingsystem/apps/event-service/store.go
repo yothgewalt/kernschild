@@ -24,7 +24,9 @@ type Store struct {
 	pool *pgxpool.Pool
 	rdb  *redis.Client
 	ttl  time.Duration
-	mu   sync.Mutex // serializes ensureInventory
+	// Rebuilds take mu exclusively. Every Redis step that is followed by a Postgres write holds it
+	// shared across both steps, so a rebuild never reads Postgres in between.
+	mu sync.RWMutex
 }
 
 type EventRow struct {
@@ -89,9 +91,13 @@ func (s *Store) Init(ctx context.Context) error {
 // ensureInventory rebuilds every counter and live hold from Postgres when the inventory:ready sentinel is gone.
 // shortcut: the mutex is per process because there is one event-service instance; scaling out needs a Redis lock.
 func (s *Store) ensureInventory(ctx context.Context) error {
+	ready := func() (bool, error) { n, err := s.rdb.Exists(ctx, readyKey).Result(); return n == 1, err }
+	if ok, err := ready(); err != nil || ok { // lock-free fast path for the per-tick check
+		return err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if n, err := s.rdb.Exists(ctx, readyKey).Result(); err != nil || n == 1 {
+	if ok, err := ready(); err != nil || ok {
 		return err
 	}
 	type ev struct{ capacity, sold, held int32 }
@@ -137,7 +143,28 @@ func (s *Store) ensureInventory(ctx context.Context) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	live := map[string]bool{}
+	for _, h := range holds {
+		live[holdKey(h.BookingID)] = true
+	}
+	// A HELD hold that is not in the journal (Redis kept data the sentinel didn't vouch for, such as
+	// an upgrade from the version without a journal) would be released or confirmed on top of the
+	// rebuilt counters, so drop it. Terminal holds stay for idempotency.
+	var stale []string
+	iter := s.rdb.Scan(ctx, 0, "hold:*", 1000).Iterator()
+	for iter.Next(ctx) {
+		if k := iter.Val(); !live[k] && s.rdb.HGet(ctx, k, "status").Val() == "HELD" {
+			stale = append(stale, k)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return err
+	}
 	pipe := s.rdb.TxPipeline()
+	if len(stale) > 0 {
+		pipe.Del(ctx, stale...)
+	}
+	pipe.Del(ctx, "holds:expiry")
 	for id, e := range events {
 		pipe.Set(ctx, availKey(id), e.capacity-e.sold-e.held, 0)
 		pipe.Set(ctx, heldKey(id), e.held, 0)
@@ -153,7 +180,7 @@ func (s *Store) ensureInventory(ctx context.Context) error {
 	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
-	logf("rebuilt inventory from postgres: %d events, %d holds", len(events), len(holds))
+	logf("rebuilt inventory from postgres: %d events, %d holds (dropped %d stale)", len(events), len(holds), len(stale))
 	return nil
 }
 
@@ -190,17 +217,25 @@ func (s *Store) fill(ctx context.Context, es ...*EventRow) error {
 }
 
 func (s *Store) CreateEvent(ctx context.Context, name string, capacity int32, price int64) (*EventRow, error) {
-	e, err := scanEvent(s.pool.QueryRow(ctx, `WITH e AS (
-		INSERT INTO events(name,capacity,price_cents) VALUES($1,$2,$3) RETURNING *)
-		SELECT `+eventCols+` FROM e`, name, capacity, price))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var e *EventRow
+	// The row commits only after the counters are set, so a Redis failure never leaves an unbookable event.
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var err error
+		if e, err = scanEvent(tx.QueryRow(ctx, `WITH e AS (
+			INSERT INTO events(name,capacity,price_cents) VALUES($1,$2,$3) RETURNING *)
+			SELECT `+eventCols+` FROM e`, name, capacity, price)); err != nil {
+			return err
+		}
+		// NX so a rebuild that ran in between is never clobbered.
+		pipe := s.rdb.Pipeline()
+		pipe.SetNX(ctx, availKey(e.ID), capacity, 0)
+		pipe.SetNX(ctx, heldKey(e.ID), 0, 0)
+		_, err = pipe.Exec(ctx)
+		return err
+	})
 	if err != nil {
-		return nil, err
-	}
-	// NX so a rebuild that ran in between is never clobbered.
-	pipe := s.rdb.Pipeline()
-	pipe.SetNX(ctx, availKey(e.ID), capacity, 0)
-	pipe.SetNX(ctx, heldKey(e.ID), 0, 0)
-	if _, err := pipe.Exec(ctx); err != nil {
 		return nil, err
 	}
 	e.Available = capacity
@@ -304,6 +339,13 @@ if redis.call('EXISTS', KEYS[1]) == 0 then return {1} end
 release(ARGV[1])
 return hold(KEYS[1])`)
 
+// Undoes a reserve whose journal insert failed: releases the seats and deletes the hold, so a retry
+// with the same booking id makes a fresh hold instead of getting a RELEASED one back.
+// KEYS: hold. ARGV: booking.
+var abortScript = redis.NewScript(luaCommon + `
+if release(ARGV[1]) then redis.call('DEL', KEYS[1]) end
+return {0}`)
+
 // Returns {processed, released booking ids}.
 var sweepScript = redis.NewScript(luaCommon + `
 local due = redis.call('ZRANGEBYSCORE', 'holds:expiry', '-inf', now_ms(), 'LIMIT', 0, 1000)
@@ -340,8 +382,23 @@ func (s *Store) ReserveSeats(ctx context.Context, bookingID, eventID string, qty
 	if err != nil {
 		return nil, err
 	}
+	// The journal insert runs on the idempotent path too, so a crash between the Lua call and it heals on retry.
 	h, code, err := s.runHold(ctx, reserveScript, bookingID,
 		[]string{holdKey(bookingID), availKey(eventID), heldKey(eventID), "holds:expiry"},
+		func(h *HoldRow) error {
+			_, err := s.pool.Exec(ctx, `INSERT INTO holds(booking_id,event_id,quantity,amount_cents,status,expires_at)
+				VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (booking_id) DO NOTHING`,
+				bookingID, h.EventID, h.Quantity, h.AmountCents, h.Status, h.ExpiresAt)
+			if err == nil {
+				return nil
+			}
+			// A hold must never exist only in Redis. WithoutCancel: a cancelled request must still release.
+			if _, rerr := abortScript.Run(context.WithoutCancel(ctx), s.rdb, []string{holdKey(bookingID)}, bookingID).Result(); rerr != nil {
+				logf("release after journal failure %s: %v", bookingID, rerr)
+			}
+			logf("hold journal insert failed for %s: %v", bookingID, err)
+			return ErrUnavailable
+		},
 		bookingID, eventID, qty, int64(qty)*price, s.ttl.Milliseconds())
 	if err != nil {
 		return nil, err
@@ -349,41 +406,48 @@ func (s *Store) ReserveSeats(ctx context.Context, bookingID, eventID string, qty
 	if code == 1 {
 		return nil, ErrNotFound
 	}
-	// Also on the idempotent path, so a crash between the Lua call and this insert heals on retry.
-	if _, err := s.pool.Exec(ctx, `INSERT INTO holds(booking_id,event_id,quantity,amount_cents,status,expires_at)
-		VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (booking_id) DO NOTHING`,
-		bookingID, h.EventID, h.Quantity, h.AmountCents, h.Status, h.ExpiresAt); err != nil {
-		// A hold must never exist only in Redis. WithoutCancel: a cancelled request must still release.
-		if _, rerr := releaseScript.Run(context.WithoutCancel(ctx), s.rdb, []string{holdKey(bookingID)}, bookingID).Result(); rerr != nil {
-			logf("release after journal failure %s: %v", bookingID, rerr)
-		}
-		logf("hold journal insert failed for %s: %v", bookingID, err)
-		return nil, ErrUnavailable
-	}
 	return h, nil
 }
 
-// runHold runs a hold script and, when it reports a missing key, rebuilds inventory and retries once.
-func (s *Store) runHold(ctx context.Context, sc *redis.Script, bookingID string, keys []string, args ...any) (*HoldRow, int64, error) {
-	res, err := sc.Run(ctx, s.rdb, keys, args...).Result()
-	if err != nil {
-		return nil, 0, err
+// runHold runs a hold script and, on success, journal (if set) under the shared lock. When the script
+// reports a missing key, it rebuilds inventory outside the lock and retries once.
+func (s *Store) runHold(ctx context.Context, sc *redis.Script, bookingID string, keys []string,
+	journal func(*HoldRow) error, args ...any) (*HoldRow, int64, error) {
+	once := func() (*HoldRow, int64, error) {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		res, err := sc.Run(ctx, s.rdb, keys, args...).Result()
+		if err != nil {
+			return nil, 0, err
+		}
+		h, code, err := holdFrom(bookingID, res)
+		if err == nil && code == 0 && journal != nil {
+			err = journal(h)
+		}
+		return h, code, err
 	}
-	h, code, err := holdFrom(bookingID, res)
+	h, code, err := once()
 	if code != 1 {
 		return h, code, err
 	}
 	if err := s.ensureInventory(ctx); err != nil {
 		return nil, 0, err
 	}
-	if res, err = sc.Run(ctx, s.rdb, keys, args...).Result(); err != nil {
-		return nil, 0, err
-	}
-	return holdFrom(bookingID, res)
+	return once()
 }
 
 func (s *Store) ConfirmSeats(ctx context.Context, bookingID string) (*HoldRow, error) {
-	h, code, err := s.runHold(ctx, confirmScript, bookingID, []string{holdKey(bookingID)}, bookingID)
+	// The sales tx runs on every OK so a crash after the Redis step heals on retry.
+	h, code, err := s.runHold(ctx, confirmScript, bookingID, []string{holdKey(bookingID)}, func(h *HoldRow) error {
+		return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `INSERT INTO sales(booking_id,event_id,quantity,amount_cents) VALUES($1,$2,$3,$4)
+				ON CONFLICT DO NOTHING`, bookingID, h.EventID, h.Quantity, h.AmountCents); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `UPDATE holds SET status='CONFIRMED', updated_at=now() WHERE booking_id=$1`, bookingID)
+			return err
+		})
+	}, bookingID)
 	if err != nil {
 		return nil, err
 	}
@@ -396,20 +460,12 @@ func (s *Store) ConfirmSeats(ctx context.Context, bookingID string) (*HoldRow, e
 		}
 		return h, err
 	}
-	// Runs on every OK so a crash after the Redis step heals on retry.
-	return h, pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO sales(booking_id,event_id,quantity,amount_cents) VALUES($1,$2,$3,$4)
-			ON CONFLICT DO NOTHING`, bookingID, h.EventID, h.Quantity, h.AmountCents); err != nil {
-			return err
-		}
-		_, err := tx.Exec(ctx, `UPDATE holds SET status='CONFIRMED', updated_at=now() WHERE booking_id=$1`, bookingID)
-		return err
-	})
+	return h, nil
 }
 
 // ReleaseSeats returns (nil, nil) when no hold exists.
 func (s *Store) ReleaseSeats(ctx context.Context, bookingID string) (*HoldRow, error) {
-	h, code, err := s.runHold(ctx, releaseScript, bookingID, []string{holdKey(bookingID)}, bookingID)
+	h, code, err := s.runHold(ctx, releaseScript, bookingID, []string{holdKey(bookingID)}, nil, bookingID)
 	if err != nil || code == 1 {
 		return nil, err
 	}

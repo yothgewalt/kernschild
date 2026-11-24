@@ -1,17 +1,18 @@
-import { config } from './config.js';
-import { createClients } from './grpc.js';
-import { createDb } from './db.js';
-import { connectMq } from './mq.js';
-import { createBookings } from './bookings.js';
-import { buildApp } from './app.js';
+import { config } from './config.ts';
+import { createClients } from './grpc.ts';
+import { createDb } from './db.ts';
+import { connectMq } from './mq.ts';
+import { createBookings } from './bookings.ts';
+import { buildApp } from './app.ts';
+import { errorMessage } from './types.ts';
 
-const log = (...a) => console.log(new Date().toISOString(), ...a);
+const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 
-async function retry(name, fn, tries = 30) {
+async function retry<T>(name: string, fn: () => Promise<T>, tries = 30): Promise<T> {
   for (let i = 1; ; i++) {
     try { return await fn(); } catch (e) {
       if (i >= tries) throw e;
-      log(`${name} not ready (${i}/${tries}): ${e.message}`);
+      log(`${name} not ready (${i}/${tries}): ${errorMessage(e)}`);
       await new Promise((r) => setTimeout(r, 1000));
     }
   }
@@ -27,7 +28,7 @@ const grpc = createClients(config); // lazy connect: dependencies being down is 
 const bookings = createBookings({ db, grpc, mq });
 await mq.consume((msg) => bookings.onResult(msg));
 
-const sweeper = setInterval(() => bookings.sweep().catch((e) => log('sweep error', e.message)), config.sweepMs);
+const sweeper = setInterval(() => bookings.sweep().catch((e: unknown) => log('sweep error', errorMessage(e))), config.sweepMs);
 const app = buildApp({ grpc, db, bookings, healthy: async () => { await db.ping(); return mq.isOpen(); } });
 await app.listen({ port: config.port, host: '0.0.0.0' });
 log(`booking listening on :${config.port}`);

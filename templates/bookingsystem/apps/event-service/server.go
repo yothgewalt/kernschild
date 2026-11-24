@@ -111,6 +111,11 @@ func (s *server) ConfirmSeats(ctx context.Context, r *pb.ConfirmSeatsRequest) (*
 		return nil, badArg("booking_id must be a uuid")
 	}
 	h, err := s.st.ConfirmSeats(ctx, r.BookingId)
+	if err != nil && !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrPrecondition) {
+		// Confirm is idempotent, and booking drops a paid result on any code but UNAVAILABLE/DEADLINE_EXCEEDED.
+		logf("confirm %s failed, retryable: %v", r.BookingId, err)
+		err = ErrUnavailable
+	}
 	if err != nil {
 		return nil, toErr(err)
 	}

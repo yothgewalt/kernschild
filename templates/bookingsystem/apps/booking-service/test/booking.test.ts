@@ -1,17 +1,35 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import pg from 'pg';
-import { createDb } from '../src/db.js';
-import { createBookings } from '../src/bookings.js';
-import { buildApp } from '../src/app.js';
-import { code } from '../src/grpc.js';
+import type { FastifyInstance } from 'fastify';
+import { createDb } from '../src/db.ts';
+import type { Db } from '../src/db.ts';
+import { createBookings } from '../src/bookings.ts';
+import type { Bookings } from '../src/bookings.ts';
+import { buildApp } from '../src/app.ts';
+import { code } from '../src/grpc.ts';
+import type { Clients, GrpcStatus } from '../src/grpc.ts';
+import type { Hold__Output } from '../src/gen/bookingsystem/event/v1/Hold.ts';
+import type { Outbox } from '../src/types.ts';
 
 const ADMIN = 'postgres://postgres:postgres@localhost:5432/postgres';
 const URL = 'postgres://postgres:postgres@localhost:5432/booking_test';
 const EVENT = '11111111-1111-4111-8111-111111111111';
 
-const rpcErr = (c, details = 'x') => Object.assign(new Error(details), { code: c, details });
-let db, app, calls, published, behavior;
+// Every RPC by name, as the fakes implement it: (req) => res, sync or async.
+type Rpcs = Clients['auth'] & Clients['event'] & Clients['payment'];
+type Req<K extends keyof Rpcs> = Parameters<Rpcs[K]>[0];
+type Res<K extends keyof Rpcs> = Awaited<ReturnType<Rpcs[K]>>;
+type Fake<K extends keyof Rpcs> = (req: Req<K>) => Res<K> | Promise<Res<K>>;
+type Fakes = { [K in keyof Rpcs]?: Fake<K> };
+
+const rpcErr = (c: GrpcStatus, details = 'x') => Object.assign(new Error(details), { code: c, details });
+const bookingIdOf = (req: unknown) => (typeof req === 'object' && req !== null && 'booking_id' in req ? req.booking_id : undefined);
+const unexpected = () => { throw new Error('unexpected call'); };
+const liveHold = (booking_id = ''): Hold__Output => ({ booking_id, event_id: EVENT, quantity: 2, amount_cents: '300000',
+  status: 'HOLD_STATUS_HELD', expires_at: new Date(Date.now() + 60000).toISOString() });
+let db: Db, app: FastifyInstance, bookings: Bookings, calls: [keyof Rpcs, unknown][], published: [keyof Outbox, Outbox[keyof Outbox]][];
+let behavior: Fakes & { publish?: Error };
 
 before(async () => {
   const admin = new pg.Client(ADMIN);
@@ -27,41 +45,49 @@ beforeEach(async () => {
   await db.ping();
   const p = new pg.Client(URL); await p.connect(); await p.query('TRUNCATE bookings, idempotency_keys'); await p.end();
   calls = []; published = []; behavior = {};
-  const rec = (name, def) => async (req) => {
+  const rec = <K extends keyof Rpcs>(name: K, def: Fake<K>) => async (req: Req<K>): Promise<Res<K>> => {
     calls.push([name, req]);
-    if (behavior[name]) return behavior[name](req);
+    const fakes: Fakes = behavior;
+    const b = fakes[name];
+    if (b) return b(req);
     return def(req);
   };
-  const grpc = {
-    auth: { ValidateToken: rec('ValidateToken', ({ token }) => {
-      const users = { good: 'u1', good2: 'u2' };
-      if (!users[token]) throw rpcErr(code.UNAUTHENTICATED, 'bad token');
-      return { user_id: users[token], email: 'a@b.c' };
-    }) },
-    event: {
-      ReserveSeats: rec('ReserveSeats', (r) => ({ hold: { booking_id: r.booking_id, amount_cents: '300000', status: 'HOLD_STATUS_HELD', expires_at: new Date(Date.now() + 60000).toISOString() } })),
-      ConfirmSeats: rec('ConfirmSeats', () => ({})),
-      ReleaseSeats: rec('ReleaseSeats', () => ({})),
-      ListEvents: rec('ListEvents', () => ({ events: [{ id: EVENT, price_cents: '150000' }] })),
+  const grpc: Clients = {
+    auth: {
+      Register: rec('Register', unexpected),
+      Login: rec('Login', unexpected),
+      ValidateToken: rec('ValidateToken', ({ token }) => {
+        const users: Record<string, string> = { good: 'u1', good2: 'u2' };
+        const user_id = token === undefined ? undefined : users[token];
+        if (!user_id) throw rpcErr(code.UNAUTHENTICATED, 'bad token');
+        return { user_id, email: 'a@b.c' };
+      }),
     },
-    payment: {},
+    event: {
+      CreateEvent: rec('CreateEvent', unexpected),
+      GetEvent: rec('GetEvent', unexpected),
+      ReserveSeats: rec('ReserveSeats', (r) => ({ hold: liveHold(r.booking_id) })),
+      ConfirmSeats: rec('ConfirmSeats', () => ({ hold: null })),
+      ReleaseSeats: rec('ReleaseSeats', () => ({ hold: null })),
+      ListEvents: rec('ListEvents', () => ({ events: [{ id: EVENT, name: 'e', capacity: 1, available: 1, held: 0, sold: 0, price_cents: '150000', created_at: '' }] })),
+    },
+    payment: { GetPayment: rec('GetPayment', unexpected), ListPayments: rec('ListPayments', unexpected) },
   };
-  const mq = { publish: async (key, body) => { if (behavior.publish) throw behavior.publish; published.push([key, body]); } };
-  const bookings = createBookings({ db, grpc, mq });
+  const mq = { publish: async <K extends keyof Outbox>(key: K, body: Outbox[K]) => { if (behavior.publish) throw behavior.publish; published.push([key, body]); } };
+  bookings = createBookings({ db, grpc, mq });
   app = buildApp({ grpc, db, bookings, healthy: async () => true });
-  app.bookings = bookings;
 });
 
-const post = (payload, token = 'good', key) => app.inject({
+const post = (payload: object, token: string | null = 'good', key?: string) => app.inject({
   method: 'POST', url: '/bookings', payload,
   headers: { ...(token && { authorization: `Bearer ${token}` }), ...(key !== undefined && { 'idempotency-key': key }) },
 });
 const create = async () => (await post({ event_id: EVENT, quantity: 2 })).json().booking;
-const result = (b, status) => app.bookings.onResult({ booking_id: b.id, payment_id: '22222222-2222-4222-8222-222222222222', status, amount_cents: 300000 });
-const status = async (id) => (await db.get(id)).status;
+const result = (b: { id: string }, status: string) => bookings.onResult({ booking_id: b.id, payment_id: '22222222-2222-4222-8222-222222222222', status, amount_cents: 300000 });
+const status = async (id: string) => (await db.get(id))?.status;
 const PAY = '22222222-2222-4222-8222-222222222222';
 const refunds = () => published.filter(([k]) => k === 'payment.refund.requested').map(([, body]) => body);
-const keyed = (key, token = 'good', quantity = 2) => post({ event_id: EVENT, quantity }, token, key);
+const keyed = (key: string, token = 'good', quantity = 2) => post({ event_id: EVENT, quantity }, token, key);
 const bookingCount = async () => {
   const p = new pg.Client(URL); await p.connect();
   const n = (await p.query('SELECT count(*)::int n FROM bookings')).rows[0].n; await p.end();
@@ -95,7 +121,7 @@ test('publish failure releases seats and marks FAILED', async () => {
   const r = await post({ event_id: EVENT, quantity: 2 });
   assert.equal(r.statusCode, 500);
   const [b] = await db.listByUser('u1');
-  assert.equal(b.status, 'FAILED');
+  assert.equal(b?.status, 'FAILED');
   assert.ok(calls.some(([n]) => n === 'ReleaseSeats'));
 });
 
@@ -103,15 +129,15 @@ test('SUCCEEDED -> CONFIRMED with payment_id', async () => {
   const b = await create();
   assert.equal(await result(b, 'SUCCEEDED'), 'ack');
   const got = (await app.inject(`/bookings/${b.id}`)).json().booking;
-  assert.equal(got.status, 'CONFIRMED');
-  assert.equal(got.payment_id, '22222222-2222-4222-8222-222222222222');
+  assert.equal(got?.status, 'CONFIRMED');
+  assert.equal(got?.payment_id, '22222222-2222-4222-8222-222222222222');
 });
 
 test('FAILED -> FAILED and seats released', async () => {
   const b = await create();
   await result(b, 'FAILED');
   assert.equal(await status(b.id), 'FAILED');
-  assert.ok(calls.some(([n, r]) => n === 'ReleaseSeats' && r.booking_id === b.id));
+  assert.ok(calls.some(([n, r]) => n === 'ReleaseSeats' && bookingIdOf(r) === b.id));
 });
 
 test('SUCCEEDED after hold expiry -> EXPIRED', async () => {
@@ -141,7 +167,7 @@ test('sweeper expires overdue PENDING bookings and releases', async () => {
   const b = await create();
   const p = new pg.Client(URL); await p.connect();
   await p.query(`UPDATE bookings SET expires_at = now() - interval '1s' WHERE id=$1`, [b.id]); await p.end();
-  await app.bookings.sweep();
+  await bookings.sweep();
   assert.equal(await status(b.id), 'EXPIRED');
   assert.ok(calls.some(([n]) => n === 'ReleaseSeats'));
 });
@@ -155,8 +181,8 @@ test('SUCCEEDED + FAILED_PRECONDITION -> EXPIRED and refund hold_expired', async
   behavior.ConfirmSeats = () => { throw rpcErr(code.FAILED_PRECONDITION); };
   assert.equal(await result(b, 'SUCCEEDED'), 'ack');
   const got = await db.get(b.id);
-  assert.equal(got.status, 'EXPIRED');
-  assert.equal(got.payment_id, PAY);
+  assert.equal(got?.status, 'EXPIRED');
+  assert.equal(got?.payment_id, PAY);
   assert.deepEqual(refunds(), [{ booking_id: b.id, payment_id: PAY, reason: 'hold_expired' }]);
 });
 
@@ -164,12 +190,12 @@ test('SUCCEEDED after the sweeper expired the booking -> refund booking_not_pend
   const b = await create();
   const p = new pg.Client(URL); await p.connect();
   await p.query(`UPDATE bookings SET expires_at = now() - interval '1s' WHERE id=$1`, [b.id]); await p.end();
-  await app.bookings.sweep();
+  await bookings.sweep();
   calls.length = 0;
   assert.equal(await result(b, 'SUCCEEDED'), 'ack');
   const got = await db.get(b.id);
-  assert.equal(got.status, 'EXPIRED');
-  assert.equal(got.payment_id, PAY);
+  assert.equal(got?.status, 'EXPIRED');
+  assert.equal(got?.payment_id, PAY);
   assert.deepEqual(refunds(), [{ booking_id: b.id, payment_id: PAY, reason: 'booking_not_pending' }]);
   assert.ok(!calls.some(([n]) => n === 'ConfirmSeats'));
 });
@@ -204,7 +230,7 @@ test('same Idempotency-Key and body twice -> same booking, second is a 200 repla
   assert.equal(r2.json().booking.id, r1.json().booking.id);
   const reserves = calls.filter(([n]) => n === 'ReserveSeats');
   assert.equal(reserves.length, 1);
-  assert.equal(reserves[0][1].booking_id, r1.json().booking.id);
+  assert.equal(bookingIdOf(reserves[0]?.[1]), r1.json().booking.id);
   // still PENDING, so the replay re-publishes payment.requested for the same booking
   assert.deepEqual(published.map(([k, body]) => [k, body.booking_id]), [['payment.requested', r1.json().booking.id], ['payment.requested', r1.json().booking.id]]);
 });
@@ -225,7 +251,7 @@ test('20 concurrent same-key requests converge on one booking', async () => {
   assert.ok(rs.every((r) => r.statusCode === 202 || r.statusCode === 200), rs.map((r) => r.statusCode).join());
   assert.equal(ids.size, 1);
   assert.equal(await bookingCount(), 1);
-  assert.ok(calls.filter(([n]) => n === 'ReserveSeats').every(([, r]) => ids.has(r.booking_id)));
+  assert.ok(calls.filter(([n]) => n === 'ReserveSeats').every(([, r]) => ids.has(bookingIdOf(r))));
 });
 
 test('same key with a different body -> 422 idempotency_key_reused', async () => {
@@ -270,45 +296,58 @@ test('sweeper deletes idempotency keys older than 24h, at most once a minute', a
   await keyed('old'); await keyed('new');
   const p = new pg.Client(URL); await p.connect();
   await p.query(`UPDATE idempotency_keys SET created_at = now() - interval '25 hours' WHERE key='old'`);
-  await app.bookings.sweep();
+  await bookings.sweep();
   const keys = async () => (await p.query('SELECT key FROM idempotency_keys ORDER BY key')).rows.map((r) => r.key);
   assert.deepEqual(await keys(), ['new']);
   await p.query(`UPDATE idempotency_keys SET created_at = now() - interval '25 hours'`);
-  await app.bookings.sweep(); // within the minute: skipped
+  await bookings.sweep(); // within the minute: skipped
   assert.deepEqual(await keys(), ['new']);
   await p.end();
 });
 
-const expireNow = async (id) => {
+const expireNow = async (id: string) => {
   const p = new pg.Client(URL); await p.connect();
   await p.query(`UPDATE bookings SET expires_at = now() - interval '1s' WHERE id=$1`, [id]); await p.end();
 };
 
-test('sweeper expires the booking while ConfirmSeats succeeds -> refund booking_not_pending', async () => {
+test('sweeper runs right after ConfirmSeats sold the seats -> booking still CONFIRMED, no refund', async () => {
   const b = await create();
-  behavior.ConfirmSeats = async () => { await expireNow(b.id); await app.bookings.sweep(); return {}; };
+  behavior.ReleaseSeats = () => ({ hold: { ...liveHold(b.id), status: 'HOLD_STATUS_CONFIRMED' } }); // release is a no-op on a sold hold
+  behavior.ConfirmSeats = async () => { await expireNow(b.id); await bookings.sweep(); return { hold: null }; };
   assert.equal(await result(b, 'SUCCEEDED'), 'ack');
   const got = await db.get(b.id);
-  assert.equal(got.status, 'EXPIRED');
-  assert.equal(got.payment_id, PAY);
-  assert.deepEqual(refunds(), [{ booking_id: b.id, payment_id: PAY, reason: 'booking_not_pending' }]);
+  assert.equal(got?.status, 'CONFIRMED');
+  assert.equal(got?.payment_id, PAY);
+  assert.deepEqual(refunds(), []);
+});
+
+test('sweeper keeps an overdue booking PENDING while event is unreachable, expires it once release works', async () => {
+  const b = await create();
+  await expireNow(b.id);
+  behavior.ReleaseSeats = () => { throw rpcErr(code.UNAVAILABLE); };
+  await bookings.sweep();
+  assert.equal(await status(b.id), 'PENDING');
+  delete behavior.ReleaseSeats;
+  await bookings.sweep();
+  assert.equal(await status(b.id), 'EXPIRED');
 });
 
 test('concurrent duplicate confirms the booking first -> no refund', async () => {
   const b = await create();
-  behavior.ConfirmSeats = async () => { await db.transition(b.id, 'CONFIRMED', PAY); return {}; };
+  behavior.ConfirmSeats = async () => { await db.transition(b.id, 'CONFIRMED', PAY); return { hold: null }; };
   assert.equal(await result(b, 'SUCCEEDED'), 'ack');
   assert.equal(await status(b.id), 'CONFIRMED');
   assert.deepEqual(refunds(), []);
 });
 
 test('keyed retry after the hold was released -> fresh booking on a live hold', async () => {
-  const holds = new Map(); // mirrors event-service: an existing hold is returned unchanged
+  const holds = new Map<string | undefined, Hold__Output>(); // mirrors event-service: an existing hold is returned unchanged
   behavior.ReserveSeats = (r) => {
-    if (!holds.has(r.booking_id)) holds.set(r.booking_id, { booking_id: r.booking_id, amount_cents: '300000', status: 'HOLD_STATUS_HELD', expires_at: new Date(Date.now() + 60000).toISOString() });
-    return { hold: holds.get(r.booking_id) };
+    const hold = holds.get(r.booking_id) ?? liveHold(r.booking_id);
+    holds.set(r.booking_id, hold);
+    return { hold };
   };
-  behavior.ReleaseSeats = (r) => { const h = holds.get(r.booking_id); if (h) h.status = 'HOLD_STATUS_RELEASED'; return {}; };
+  behavior.ReleaseSeats = (r) => { const h = holds.get(r.booking_id); if (h) h.status = 'HOLD_STATUS_RELEASED'; return { hold: null }; };
   const insert = db.insert;
   db.insert = async () => { db.insert = insert; throw new Error('pg blip'); };
   const r1 = await keyed('k1');
@@ -317,7 +356,7 @@ test('keyed retry after the hold was released -> fresh booking on a live hold', 
   assert.equal(r2.statusCode, 202);
   const b = r2.json().booking;
   assert.equal(b.status, 'PENDING');
-  assert.equal(holds.get(b.id).status, 'HOLD_STATUS_HELD');
+  assert.equal(holds.get(b.id)?.status, 'HOLD_STATUS_HELD');
   assert.equal(await bookingCount(), 1);
   const r3 = await keyed('k1');
   assert.equal(r3.statusCode, 200);
@@ -326,7 +365,7 @@ test('keyed retry after the hold was released -> fresh booking on a live hold', 
 
 test('keyed retry after the hold expired but before the event sweeper -> fresh booking', async () => {
   let n = 0;
-  behavior.ReserveSeats = (r) => ({ hold: { booking_id: r.booking_id, amount_cents: '300000', status: 'HOLD_STATUS_HELD',
+  behavior.ReserveSeats = (r) => ({ hold: { ...liveHold(r.booking_id),
     expires_at: new Date(Date.now() + (n++ === 0 ? -1000 : 60000)).toISOString() } });
   const r = await keyed('k1');
   assert.equal(r.statusCode, 202);

@@ -16,7 +16,9 @@ async function newEvent(token, capacity) {
   return (await must('POST', '/events', { token, body })).event;
 }
 
-const eventNow = async (id) => (await must('GET', `/events/${id}`)).event;
+async function eventNow(id) {
+  return (await must("GET", `/events/${id}`)).event;
+}
 
 async function until(label, fn, seconds = 60) {
   for (let i = 0; i < seconds * 2; i++) {

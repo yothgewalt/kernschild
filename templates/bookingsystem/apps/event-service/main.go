@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/health"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
@@ -77,6 +78,9 @@ func connectRedis(ctx context.Context, url string) *redis.Client {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		os.Exit(healthcheck(env("GRPC_ADDR", ":50052")))
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -123,4 +127,24 @@ func main() {
 	if err := g.Serve(lis); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// healthcheck backs the compose healthcheck (distroless has no shell): exit 0 when the gRPC health service reports SERVING.
+func healthcheck(addr string) int {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 1
+	}
+	conn, err := grpc.NewClient("localhost:"+port, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return 1
+	}
+	defer conn.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r, err := healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{})
+	if err != nil || r.Status != healthpb.HealthCheckResponse_SERVING {
+		return 1
+	}
+	return 0
 }

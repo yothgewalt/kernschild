@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	pb "event-service/gen/bookingsystem/event/v1"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
@@ -392,6 +394,140 @@ func TestReserveRetryWritesMissingJournal(t *testing.T) {
 	}
 	if e := avail(t, st, ev.ID); e.Available != 8 || e.Held != 2 {
 		t.Fatalf("%+v", e)
+	}
+}
+
+// trigger runs body (plpgsql) before each insert into table for one booking, until the test ends.
+func trigger(t *testing.T, st *Store, table, bookingID, body string) {
+	t.Helper()
+	ctx := context.Background()
+	fn := "t_" + table
+	if _, err := st.pool.Exec(ctx, `CREATE OR REPLACE FUNCTION `+fn+`() RETURNS trigger AS $$ BEGIN
+		IF NEW.booking_id = '`+bookingID+`' THEN `+body+`; END IF; RETURN NEW; END $$ LANGUAGE plpgsql;
+		CREATE OR REPLACE TRIGGER `+fn+` BEFORE INSERT ON `+table+` FOR EACH ROW EXECUTE FUNCTION `+fn+`()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.pool.Exec(ctx, `DROP TRIGGER IF EXISTS `+fn+` ON `+table) })
+}
+
+func TestReserveRetryAfterJournalFailure(t *testing.T) {
+	st := newStore(t, time.Minute)
+	ctx := context.Background()
+	ev := newEvent(t, st, 10)
+	id := newUUID()
+	trigger(t, st, "holds", id, "RAISE EXCEPTION 'journal down'")
+	if _, err := st.ReserveSeats(ctx, id, ev.ID, 3); status.Code(toErr(err)) != codes.Unavailable {
+		t.Fatalf("want UNAVAILABLE, got %v", err)
+	}
+	if e := avail(t, st, ev.ID); e.Available != 10 || e.Held != 0 {
+		t.Fatalf("after failed reserve %+v", e)
+	}
+	st.pool.Exec(ctx, `DROP TRIGGER t_holds ON holds`)
+	// An Idempotency-Key retry reuses the booking id and must get a real hold.
+	if h, err := st.ReserveSeats(ctx, id, ev.ID, 3); err != nil || h.Status != "HELD" {
+		t.Fatalf("retry: %v %+v", err, h)
+	}
+	if s := journalStatus(t, st, id); s != "HELD" {
+		t.Fatalf("journal status=%s", s)
+	}
+	if e := avail(t, st, ev.ID); e.Available != 7 || e.Held != 3 {
+		t.Fatalf("after retry %+v", e)
+	}
+}
+
+func TestRebuildWaitsForInflightConfirm(t *testing.T) {
+	st := newStore(t, 1500*time.Millisecond)
+	ctx := context.Background()
+	ev := newEvent(t, st, 10)
+	id := newUUID()
+	if _, err := st.ReserveSeats(ctx, id, ev.ID, 3); err != nil {
+		t.Fatal(err)
+	}
+	trigger(t, st, "sales", id, "PERFORM pg_sleep(0.5)")
+	done := make(chan error, 1)
+	go func() { _, err := st.ConfirmSeats(ctx, id); done <- err }()
+	for st.rdb.HGet(ctx, holdKey(id), "status").Val() != "CONFIRMED" {
+		time.Sleep(5 * time.Millisecond)
+	}
+	flush(t, st) // Redis loses its data between the confirm Lua and the sales commit
+	if _, err := st.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1600 * time.Millisecond)
+	if _, err := st.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if e := avail(t, st, ev.ID); e.Available != 7 || e.Held != 0 || e.Sold != 3 {
+		t.Fatalf("oversold: %+v", e)
+	}
+}
+
+func TestRebuildDropsStaleRedisHolds(t *testing.T) {
+	st := newStore(t, time.Minute)
+	ctx := context.Background()
+	ev := newEvent(t, st, 10)
+	id := newUUID()
+	if _, err := st.ReserveSeats(ctx, id, ev.ID, 4); err != nil {
+		t.Fatal(err)
+	}
+	// Upgrade from the version without a journal: live Redis holds, no sentinel, no journal rows.
+	st.pool.Exec(ctx, `DELETE FROM holds WHERE booking_id=$1`, id)
+	st.rdb.Del(ctx, readyKey)
+	if err := st.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ConfirmSeats(ctx, id); err != ErrNotFound {
+		t.Fatalf("confirm of a dropped hold: %v", err)
+	}
+	if err := st.rdb.ZScore(ctx, "holds:expiry", id).Err(); err != redis.Nil {
+		t.Fatalf("stale expiry member kept: %v", err)
+	}
+	if e := avail(t, st, ev.ID); e.Available != 10 || e.Held != 0 || e.Sold != 0 {
+		t.Fatalf("%+v", e)
+	}
+}
+
+func TestCreateEventRedisDownLeavesNoRow(t *testing.T) {
+	st := newStore(t, time.Minute)
+	ctx := context.Background()
+	down := &Store{pool: st.pool, rdb: redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", MaxRetries: -1}), ttl: st.ttl}
+	name := newUUID()
+	if _, err := down.CreateEvent(ctx, name, 10, 100); err == nil {
+		t.Fatal("want error with redis down")
+	}
+	var n int
+	st.pool.QueryRow(ctx, `SELECT count(*) FROM events WHERE name=$1`, name).Scan(&n)
+	if n != 0 {
+		t.Fatal("event row exists without redis counters")
+	}
+}
+
+func TestConfirmJournalFailureIsRetryable(t *testing.T) {
+	st := newStore(t, time.Minute)
+	ctx := context.Background()
+	srv := &server{st: st}
+	ev := newEvent(t, st, 10)
+	id := newUUID()
+	if _, err := st.ReserveSeats(ctx, id, ev.ID, 3); err != nil {
+		t.Fatal(err)
+	}
+	trigger(t, st, "sales", id, "RAISE EXCEPTION 'postgres down'")
+	// booking-service requeues only UNAVAILABLE/DEADLINE_EXCEEDED; anything else drops a paid result.
+	if _, err := srv.ConfirmSeats(ctx, &pb.ConfirmSeatsRequest{BookingId: id}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("want UNAVAILABLE, got %v", err)
+	}
+	st.pool.Exec(ctx, `DROP TRIGGER t_sales ON sales`)
+	if _, err := srv.ConfirmSeats(ctx, &pb.ConfirmSeatsRequest{BookingId: id}); err != nil {
+		t.Fatal(err)
+	}
+	if e := avail(t, st, ev.ID); e.Available != 7 || e.Held != 0 || e.Sold != 3 {
+		t.Fatalf("%+v", e)
+	}
+	if s := journalStatus(t, st, id); s != "CONFIRMED" {
+		t.Fatalf("journal status=%s", s)
 	}
 }
 

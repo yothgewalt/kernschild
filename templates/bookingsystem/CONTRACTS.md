@@ -282,9 +282,15 @@ Status machine: `PENDING → CONFIRMED | FAILED | EXPIRED`. Every transition is
     idempotent at the payment side, so republishing on redelivery is safe.
   - Ack after the DB update and any refund publish. On a transient gRPC error
     (UNAVAILABLE/DEADLINE_EXCEEDED) or a publish failure, nack with requeue.
-- Sweeper every `SWEEP_INTERVAL_MS`: `UPDATE bookings SET status='EXPIRED' WHERE status='PENDING' AND expires_at <= now() RETURNING id`,
-  then call `Event.ReleaseSeats` for each. That call is idempotent, and the event sweeper also
-  covers it.
+- Sweeper every `SWEEP_INTERVAL_MS`. For each PENDING booking with `expires_at <= now()`
+  (up to 1000 per tick), call `Event.ReleaseSeats` **first**, because event owns the hold
+  and the deciding clock:
+  - If the returned hold is CONFIRMED, a paid result is mid-flight, so leave the booking
+    for the result consumer to confirm.
+  - If the call fails, leave the booking PENDING and retry on the next tick.
+  - Otherwise, transition it to EXPIRED.
+
+  This order means booking never expires a booking whose seats event already sold.
 - Auth header: `Authorization: Bearer <token>`. Validate via `Auth.ValidateToken`.
   `UNAUTHENTICATED` → 401.
 
@@ -307,7 +313,8 @@ HTTP API (JSON; error bodies are `{"error": "<snake_case>", "message": "..."}`):
 
 Booking JSON uses snake_case fields that mirror the table columns. Proto enums are rendered as
 strings without their prefix: `PAYMENT_STATUS_SUCCEEDED` → `"SUCCEEDED"`. Every gRPC call has
-a deadline of 5s.
+a deadline of 5s and `waitForReady`. Clients re-resolve DNS after 1s and cap reconnect backoff at 2s,
+so a recreated peer with a new IP is reachable again within seconds.
 
 ## Repository layout
 

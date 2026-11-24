@@ -1,22 +1,33 @@
 // Booking orchestration and the one status machine: PENDING -> CONFIRMED | FAILED | EXPIRED.
 // Every transition goes through db.transition (guarded on status='PENDING').
 import { createHash, randomUUID } from 'node:crypto';
-import { code } from './grpc.js';
+import { code, grpcCode } from './grpc.ts';
+import type { Clients } from './grpc.ts';
+import type { Db } from './db.ts';
+import type { Mq } from './mq.ts';
+import { errorMessage, isPaymentResult } from './types.ts';
+import type { AuthedUser, Booking, BookingStatus, RefundReason } from './types.ts';
 
-const log = (...a) => console.log(new Date().toISOString(), ...a);
+const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 const KEY_SWEEP_MS = 60_000;
 
-const httpError = (status, error, message) => Object.assign(new Error(message), { statusCode: status, httpError: error });
+export type HttpError = Error & { statusCode: number; httpError: string };
+const httpError = (status: number, error: string, message: string): HttpError =>
+  Object.assign(new Error(message), { statusCode: status, httpError: error });
 
-export function createBookings({ db, grpc, mq }) {
+export type Verdict = 'ack' | 'requeue';
+export interface BookingRequest { event_id: string; quantity: number }
+export type Bookings = ReturnType<typeof createBookings>;
+
+export function createBookings({ db, grpc, mq }: { db: Db; grpc: Clients; mq: Pick<Mq, 'publish'> }) {
   let lastKeySweep = 0;
-  const requestPayment = (b) =>
+  const requestPayment = (b: Pick<Booking, 'id' | 'user_id' | 'event_id' | 'amount_cents'>) =>
     mq.publish('payment.requested', { booking_id: b.id, user_id: b.user_id, event_id: b.event_id, amount_cents: b.amount_cents });
 
   const bookings = {
     // Returns { booking, replayed }. With an idempotency key, the booking id comes from the stored key.
-    async create(user, { event_id, quantity }, key, rebound = false) {
-      let id = randomUUID();
+    async create(user: AuthedUser, { event_id, quantity }: BookingRequest, key: string | undefined, rebound = false): Promise<{ booking: Booking | undefined; replayed: boolean }> {
+      let id: string = randomUUID();
       if (key !== undefined) {
         const hash = createHash('sha256').update(JSON.stringify({ event_id, quantity })).digest('hex');
         const stored = await db.claimKey(user.user_id, key, hash, id);
@@ -30,6 +41,7 @@ export function createBookings({ db, grpc, mq }) {
         }
       }
       const { hold } = await grpc.event.ReserveSeats({ booking_id: id, event_id, quantity });
+      if (!hold) throw new Error(`ReserveSeats returned no hold for ${id}`);
       if (hold.status !== 'HOLD_STATUS_HELD' || Date.parse(hold.expires_at) <= Date.now()) {
         // A keyed retry of a try that reserved but never inserted, whose hold has since died:
         // ReserveSeats returns it unchanged forever, so rebind the key to a fresh id once.
@@ -46,7 +58,7 @@ export function createBookings({ db, grpc, mq }) {
       try {
         await requestPayment(b);
       } catch (e) {
-        log('publish failed, releasing', id, e.message);
+        log('publish failed, releasing', id, errorMessage(e));
         await grpc.event.ReleaseSeats({ booking_id: id }).catch(() => {});
         await db.transition(id, 'FAILED');
         throw e;
@@ -57,22 +69,22 @@ export function createBookings({ db, grpc, mq }) {
 
     // Returns 'ack' or 'requeue'. Duplicate and late messages are no-ops, except that a
     // SUCCEEDED payment on a booking that will never confirm is refunded (idempotent downstream).
-    async onResult(msg) {
-      if (msg?.status !== 'SUCCEEDED' && msg?.status !== 'FAILED') throw new Error('bad result message');
+    async onResult(msg: unknown): Promise<Verdict> {
+      if (!isPaymentResult(msg)) throw new Error('bad result message');
       // shortcut: every failure below requeues (a dropped SUCCEEDED is a charge never refunded), so a
       // permanently failing message retries once a second forever; add a DLX if that shows up.
       try {
         const b = await db.get(msg.booking_id);
         if (!b) { log('result for unknown booking', msg.booking_id); return 'ack'; }
-        const refund = async (reason) => {
+        const refund = async (reason: RefundReason): Promise<Verdict> => {
           try {
             await mq.publish('payment.refund.requested', { booking_id: b.id, payment_id: msg.payment_id, reason });
-          } catch (e) { log('refund publish failed, requeue', b.id, e.message); return 'requeue'; }
+          } catch (e) { log('refund publish failed, requeue', b.id, errorMessage(e)); return 'requeue'; }
           log('refund requested', b.id, reason);
           return 'ack';
         };
         // SUCCEEDED on a booking that is no longer PENDING: CONFIRMED is a duplicate, anything else is refunded.
-        const notPending = async (status) => {
+        const notPending = async (status: BookingStatus | undefined): Promise<Verdict> => {
           if (status === 'CONFIRMED') return 'ack';
           await db.setPaymentIdIfNull(b.id, msg.payment_id);
           return refund('booking_not_pending');
@@ -87,26 +99,29 @@ export function createBookings({ db, grpc, mq }) {
         try {
           await grpc.event.ConfirmSeats({ booking_id: b.id });
         } catch (e) {
-          if (e.code !== code.FAILED_PRECONDITION && e.code !== code.NOT_FOUND) throw e;
+          if (grpcCode(e) !== code.FAILED_PRECONDITION && grpcCode(e) !== code.NOT_FOUND) throw e;
           if (await db.transition(b.id, 'EXPIRED', msg.payment_id)) log('booking expired: payment succeeded after hold expired', b.id);
           else await db.setPaymentIdIfNull(b.id, msg.payment_id); // the sweeper expired it meanwhile
           return refund('hold_expired');
         }
         if (await db.transition(b.id, 'CONFIRMED', msg.payment_id)) { log('booking confirmed', b.id); return 'ack'; }
-        // Lost the race to the sweeper after ConfirmSeats sold the seats, or a duplicate confirmed it first.
-        // The sale stays recorded on the event side; booking has no way to undo it.
+        // A duplicate confirmed it first (the sweeper never expires a booking whose hold is CONFIRMED).
         log('booking left PENDING during confirm', b.id);
-        return notPending((await db.get(b.id)).status);
+        return notPending((await db.get(b.id))?.status);
       } catch (e) {
-        log('result handling failed, requeue', msg.booking_id, e.message);
+        log('result handling failed, requeue', msg.booking_id, errorMessage(e));
         return 'requeue';
       }
     },
 
+    // Event owns the hold, so release first and let its answer decide: a hold it already
+    // CONFIRMED means a paid result is mid-flight and will confirm this booking.
     async sweep() {
-      for (const id of await db.expireOverdue()) {
-        log('booking expired', id);
-        await grpc.event.ReleaseSeats({ booking_id: id }).catch((e) => log('release failed', id, e.message));
+      for (const id of await db.listOverdue()) {
+        let hold;
+        try { ({ hold } = await grpc.event.ReleaseSeats({ booking_id: id })); } catch (e) { log('release failed, retry next sweep', id, errorMessage(e)); continue; }
+        if (hold?.status === 'HOLD_STATUS_CONFIRMED') continue;
+        if (await db.transition(id, 'EXPIRED')) log('booking expired', id);
       }
       if (Date.now() - lastKeySweep >= KEY_SWEEP_MS) {
         lastKeySweep = Date.now();

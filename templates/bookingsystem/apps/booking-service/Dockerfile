@@ -7,4 +7,4 @@ COPY src ./src
 COPY proto ./proto
 USER node
 EXPOSE 3000
-CMD ["node", "src/main.js"]
+CMD ["node", "src/main.ts"]
