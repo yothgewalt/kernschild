@@ -1,5 +1,5 @@
 {
-  "C_Cpp.default.includePath": ["${workspaceFolder}/bpf"],
+  "C_Cpp.default.includePath": ["${workspaceFolder}/ebpf"],
   "C_Cpp.files.exclude": {
     "**/.terraform": true,
     "terraform": true,
