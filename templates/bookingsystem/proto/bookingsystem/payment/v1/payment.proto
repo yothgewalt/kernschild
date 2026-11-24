@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package bookingsystem.payment.v1;
+
+// Payments are started asynchronously from the RabbitMQ queue "payment.requests"
+// and refunded from "payment.refunds"; this service only exposes read access over gRPC.
+service PaymentService {
+  // GetPayment returns NOT_FOUND when no payment exists for booking_id yet.
+  rpc GetPayment(GetPaymentRequest) returns (GetPaymentResponse);
+  rpc ListPayments(ListPaymentsRequest) returns (ListPaymentsResponse);
+}
+
+enum PaymentStatus {
+  PAYMENT_STATUS_UNSPECIFIED = 0;
+  PAYMENT_STATUS_PROCESSING = 1;
+  PAYMENT_STATUS_SUCCEEDED = 2;
+  PAYMENT_STATUS_FAILED = 3;
+  // Charged, then refunded because the booking could not be confirmed (hold expired).
+  PAYMENT_STATUS_REFUNDED = 4;
+}
+
+message Payment {
+  string id = 1;
+  string booking_id = 2;
+  string user_id = 3;
+  int64 amount_cents = 4;
+  PaymentStatus status = 5;
+  string created_at = 6; // RFC 3339
+  string updated_at = 7; // RFC 3339
+}
+
+message GetPaymentRequest {
+  string booking_id = 1;
+}
+
+message GetPaymentResponse {
+  Payment payment = 1;
+}
+
+message ListPaymentsRequest {
+  int32 limit = 1; // default 50, max 500
+}
+
+message ListPaymentsResponse {
+  repeated Payment payments = 1;
+}

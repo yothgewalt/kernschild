@@ -1,0 +1,18 @@
+# Run from this directory: buf generate (or: task gen from the repo root).
+version: v2
+inputs:
+  - directory: ../../proto
+    paths: [../../proto/bookingsystem/auth]
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: auth-service/gen
+clean: true
+plugins:
+  - local: ["go", "tool", "protoc-gen-go"]
+    out: gen
+    opt: paths=source_relative
+  - local: ["go", "tool", "protoc-gen-go-grpc"]
+    out: gen
+    opt: paths=source_relative

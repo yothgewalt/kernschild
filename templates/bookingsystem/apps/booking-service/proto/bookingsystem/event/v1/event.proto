@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+package bookingsystem.event.v1;
+
+service EventService {
+  rpc CreateEvent(CreateEventRequest) returns (CreateEventResponse);
+  rpc GetEvent(GetEventRequest) returns (GetEventResponse);
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+
+  // ReserveSeats places a temporary hold keyed by booking_id. Calling it again
+  // with the same booking_id returns the existing hold. Returns RESOURCE_EXHAUSTED
+  // when not enough seats are available and NOT_FOUND for an unknown event.
+  rpc ReserveSeats(ReserveSeatsRequest) returns (ReserveSeatsResponse);
+  // ConfirmSeats turns a live hold into sold seats. Idempotent. Returns
+  // FAILED_PRECONDITION when the hold expired or was released.
+  rpc ConfirmSeats(ConfirmSeatsRequest) returns (ConfirmSeatsResponse);
+  // ReleaseSeats returns held seats to the pool. Idempotent; no-op if not held.
+  rpc ReleaseSeats(ReleaseSeatsRequest) returns (ReleaseSeatsResponse);
+}
+
+message Event {
+  string id = 1;
+  string name = 2;
+  int32 capacity = 3;
+  int32 available = 4; // capacity - held - sold
+  int32 held = 5;
+  int32 sold = 6;
+  int64 price_cents = 7;
+  string created_at = 8; // RFC 3339
+}
+
+message CreateEventRequest {
+  string name = 1;
+  int32 capacity = 2;
+  int64 price_cents = 3;
+}
+
+message CreateEventResponse {
+  Event event = 1;
+}
+
+message GetEventRequest {
+  string id = 1;
+}
+
+message GetEventResponse {
+  Event event = 1;
+}
+
+message ListEventsRequest {}
+
+message ListEventsResponse {
+  repeated Event events = 1;
+}
+
+enum HoldStatus {
+  HOLD_STATUS_UNSPECIFIED = 0;
+  HOLD_STATUS_HELD = 1;
+  HOLD_STATUS_CONFIRMED = 2;
+  HOLD_STATUS_RELEASED = 3;
+}
+
+message Hold {
+  string booking_id = 1;
+  string event_id = 2;
+  int32 quantity = 3;
+  int64 amount_cents = 4; // quantity * price_cents
+  HoldStatus status = 5;
+  string expires_at = 6; // RFC 3339
+}
+
+message ReserveSeatsRequest {
+  string booking_id = 1;
+  string event_id = 2;
+  int32 quantity = 3;
+}
+
+message ReserveSeatsResponse {
+  Hold hold = 1;
+}
+
+message ConfirmSeatsRequest {
+  string booking_id = 1;
+}
+
+message ConfirmSeatsResponse {
+  Hold hold = 1;
+}
+
+message ReleaseSeatsRequest {
+  string booking_id = 1;
+}
+
+message ReleaseSeatsResponse {
+  Hold hold = 1; // unset when no hold exists for booking_id
+}

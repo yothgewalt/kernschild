@@ -3,11 +3,114 @@
 version: '3'
 
 vars:
-  GREETING: Hello, world!
+  N: 500        # loadtest: concurrent booking requests
+  CAPACITY: 100 # loadtest: seats in the fresh event
+  USERS: 20     # loadtest: distinct users sending them
 
 tasks:
   default:
-    desc: Print a greeting message
+    desc: List available tasks
     cmds:
-      - echo "{{.GREETING}}"
+      - task --list
     silent: true
+
+  gen:
+    desc: Lint protos, regenerate each app's gRPC code (Go, Python) and export .proto files for the Node app
+    cmds:
+      - buf lint
+      - for: [auth-service, event-service, payment-service]
+        cmd: cd apps/{{.ITEM}} && buf generate
+      - rm -rf apps/booking-service/proto && buf export proto --output apps/booking-service/proto
+
+  tidy:
+    desc: Install/refresh local dependencies for all services
+    cmds:
+      - for: [auth-service, event-service]
+        cmd: cd apps/{{.ITEM}} && go mod tidy
+      - npm install --prefix apps/booking-service
+      - uv sync --directory apps/payment-service
+
+  infra:
+    desc: Start only Postgres, Redis and RabbitMQ (for local tests)
+    cmds:
+      - docker compose up -d --wait postgres redis rabbitmq
+
+  test:
+    desc: Run every service's tests (Go tests hit the compose Postgres)
+    deps: [infra]
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/event_test?sslmode=disable
+      TEST_REDIS_URL: redis://localhost:6379/15
+    cmds:
+      - for: [auth-service, event-service]
+        cmd: cd apps/{{.ITEM}} && go vet ./... && go test -race -count=1 ./...
+      - npm ci --prefix apps/booking-service --no-audit --no-fund
+      - npm test --prefix apps/booking-service
+      - uv run --directory apps/payment-service pytest -q
+
+  build:
+    desc: Build all service images
+    cmds:
+      - docker compose build
+
+  up:
+    desc: Build and start the whole system, waiting until it is healthy
+    cmds:
+      - docker compose up -d --build --wait
+      - cmd: |
+          echo "booking API      http://localhost:3000  (try: task demo)"
+          echo "RabbitMQ UI      http://localhost:15672 (guest/guest)"
+          echo "gRPC             auth :50051  event :50052  payment :50053"
+        silent: true
+
+  down:
+    desc: Stop the system (keeps data)
+    cmds:
+      - docker compose down
+
+  reset:
+    desc: Stop the system and delete all data volumes
+    cmds:
+      - docker compose down -v --remove-orphans
+
+  ps:
+    desc: Show container status
+    cmds:
+      - docker compose ps
+
+  logs:
+    desc: 'Follow logs (e.g. task logs -- booking payment)'
+    cmds:
+      - docker compose logs -f {{.CLI_ARGS}}
+
+  demo:
+    desc: Walk one booking through PENDING → CONFIRMED/FAILED
+    cmds:
+      - node scripts/demo.mjs
+
+  demo:expiry:
+    desc: Make payment slower than the seat hold, show a booking EXPIRE, then restore defaults
+    cmds:
+      - HOLD_TTL=5s PAYMENT_MIN_DELAY=8 PAYMENT_MAX_DELAY=10 PAYMENT_SUCCESS_RATE=1 docker compose up -d --wait event payment
+      - defer: docker compose up -d --wait event payment
+      - node scripts/demo.mjs
+
+  check:
+    desc: Prove idempotent bookings, late-payment refunds and Redis-loss recovery end to end
+    cmds:
+      - node scripts/check.mjs idempotency
+      - defer: docker compose up -d --wait event payment
+      - HOLD_TTL=5s PAYMENT_MIN_DELAY=8 PAYMENT_MAX_DELAY=10 PAYMENT_SUCCESS_RATE=1 docker compose up -d --wait event payment
+      - node scripts/check.mjs refund
+      - HOLD_TTL=60s PAYMENT_MIN_DELAY=6 PAYMENT_MAX_DELAY=8 PAYMENT_SUCCESS_RATE=1 docker compose up -d --wait event payment
+      - node scripts/check.mjs redis-loss
+
+  loadtest:
+    desc: 'Fire N concurrent bookings at CAPACITY seats and assert no oversell (task loadtest N=1000 CAPACITY=50)'
+    cmds:
+      - node scripts/loadtest.mjs {{.N}} {{.CAPACITY}} {{.USERS}}
+
+  stats:
+    desc: Show booking counts by status and event inventory
+    cmds:
+      - curl -s http://localhost:3000/stats | jq

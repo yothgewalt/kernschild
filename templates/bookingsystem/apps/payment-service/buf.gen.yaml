@@ -1,0 +1,13 @@
+# Run from this directory: buf generate (or: task gen from the repo root).
+version: v2
+inputs:
+  - directory: ../../proto
+    paths: [../../proto/bookingsystem/payment]
+clean: true
+plugins:
+  - remote: buf.build/protocolbuffers/python
+    out: gen
+  - remote: buf.build/protocolbuffers/pyi
+    out: gen
+  - remote: buf.build/grpc/python
+    out: gen

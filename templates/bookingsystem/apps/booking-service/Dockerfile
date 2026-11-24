@@ -1,0 +1,10 @@
+FROM node:26.12.0-alpine3.23
+ENV NODE_ENV=production
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY src ./src
+COPY proto ./proto
+USER node
+EXPOSE 3000
+CMD ["node", "src/main.js"]
