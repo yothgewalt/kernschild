@@ -2,6 +2,7 @@ import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import pg from 'pg';
 import { gunzipSync } from 'node:zlib';
+import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { createDb } from '../src/db.ts';
 import type { Db } from '../src/db.ts';
@@ -11,11 +12,13 @@ import { buildApp } from '../src/app.ts';
 import { code } from '../src/grpc.ts';
 import type { Clients, GrpcStatus } from '../src/grpc.ts';
 import type { Hold__Output } from '../src/gen/bookingsystem/event/v1/Hold.ts';
-import type { Booking, Outbox } from '../src/types.ts';
+import type { Booking, Customer, Outbox } from '../src/types.ts';
 
 // The fields the tests read from a response body. JSON turns the booking's Dates into strings.
+type BookingJson = { [K in keyof Booking]: Booking[K] extends Date ? string : Booking[K] };
 interface Body {
-  booking: { [K in keyof Booking]: Booking[K] extends Date ? string : Booking[K] };
+  booking: BookingJson;
+  bookings: BookingJson[];
   error: string;
   events: { price_cents: number }[];
 }
@@ -23,9 +26,11 @@ interface Body {
 const ADMIN = 'postgres://postgres:postgres@localhost:5432/postgres';
 const URL = 'postgres://postgres:postgres@localhost:5432/booking_test';
 const EVENT = '11111111-1111-4111-8111-111111111111';
+const ADA: Customer = { email: 'ada@example.com', name: 'Ada' };
+const BOB: Customer = { email: 'bob@example.com', name: 'Bob' };
 
 // Every RPC by name, as the fakes implement it: (req) => res, sync or async.
-type Rpcs = Clients['auth'] & Clients['event'] & Clients['payment'];
+type Rpcs = Clients['event'] & Clients['payment'];
 type Req<K extends keyof Rpcs> = Parameters<Rpcs[K]>[0];
 type Res<K extends keyof Rpcs> = Awaited<ReturnType<Rpcs[K]>>;
 type Fake<K extends keyof Rpcs> = (req: Req<K>) => Res<K> | Promise<Res<K>>;
@@ -61,16 +66,6 @@ beforeEach(async () => {
     return def(req);
   };
   const grpc: Clients = {
-    auth: {
-      Register: rec('Register', unexpected),
-      Login: rec('Login', unexpected),
-      ValidateToken: rec('ValidateToken', ({ token }) => {
-        const users: Record<string, string> = { good: 'u1', good2: 'u2' };
-        const user_id = users[token];
-        if (!user_id) throw rpcErr(code.UNAUTHENTICATED, 'bad token');
-        return { user_id, email: 'a@b.c' };
-      }),
-    },
     event: {
       CreateEvent: rec('CreateEvent', unexpected),
       GetEvent: rec('GetEvent', unexpected),
@@ -86,16 +81,16 @@ beforeEach(async () => {
   app = await buildApp({ grpc, db, bookings, healthy: async () => true });
 });
 
-const post = (payload: object, token: string | null = 'good', key?: string) => app.inject({
-  method: 'POST', url: '/bookings', payload,
-  headers: { ...(token && { authorization: `Bearer ${token}` }), ...(key !== undefined && { 'idempotency-key': key }) },
+const post = (payload: object, key?: string) => app.inject({
+  method: 'POST', url: '/bookings', payload, headers: key === undefined ? {} : { 'idempotency-key': key },
 });
-const create = async () => (await post({ event_id: EVENT, quantity: 2 })).json<Body>().booking;
+const create = async () => (await post({ event_id: EVENT, quantity: 2, ...ADA })).json<Body>().booking;
 const result = (b: { id: string }, status: string) => bookings.onResult({ booking_id: b.id, payment_id: '22222222-2222-4222-8222-222222222222', status, amount_cents: 300000 });
 const status = async (id: string) => (await db.get(id))?.status;
 const PAY = '22222222-2222-4222-8222-222222222222';
 const refunds = () => published.filter(([k]) => k === 'payment.refund.requested').map(([, body]) => body);
-const keyed = (key: string, token = 'good', quantity = 2) => post({ event_id: EVENT, quantity }, token, key);
+const keyed = (key: string, customer: Customer = ADA, quantity = 2) => post({ event_id: EVENT, quantity, ...customer }, key);
+const listFor = (email: string) => app.inject(`/bookings?email=${encodeURIComponent(email)}`);
 const bookingCount = async () => {
   const p = new pg.Client(URL); await p.connect();
   const n = (await p.query<{ n: number }>('SELECT count(*)::int n FROM bookings')).rows[0]?.n; await p.end();
@@ -104,31 +99,88 @@ const bookingCount = async () => {
 
 test('sold out -> 409 sold_out', async () => {
   behavior.ReserveSeats = () => { throw rpcErr(code.RESOURCE_EXHAUSTED); };
-  const r = await post({ event_id: EVENT, quantity: 2 });
+  const r = await post({ event_id: EVENT, quantity: 2, ...ADA });
   assert.equal(r.statusCode, 409);
   assert.equal(r.json<Body>().error, 'sold_out');
 });
 
-test('missing or invalid token -> 401, even with an invalid body', async () => {
-  assert.equal((await post({ event_id: EVENT, quantity: 1 }, null)).statusCode, 401);
-  assert.equal((await post({ event_id: EVENT, quantity: 1 }, 'nope')).statusCode, 401);
-  assert.equal((await post({}, 'nope')).statusCode, 401);
+test('bad email or name -> 400 invalid_request, nothing reserved or stored', async () => {
+  const at = (local: string) => `${local}@example.com`; // 12 chars after the local part
+  const bad: [string, object][] = [
+    ['missing email', { name: 'Ada' }],
+    ['invalid email', { email: 'not-an-email', name: 'Ada' }],
+    ['over-long email', { email: at('a'.repeat(243)), name: 'Ada' }],
+    ['missing name', { email: ADA.email }],
+    ['blank name', { email: ADA.email, name: '   ' }],
+    ['over-long name', { email: ADA.email, name: 'x'.repeat(101) }],
+    // Ajv's coerceTypes would unwrap these into strings that skipped trim/lowercase
+    ['email in an array', { email: ['ADA@EXAMPLE.COM'], name: 'Ada' }],
+    ['blank name in an array', { email: ADA.email, name: ['   '] }],
+    ['name as a number', { email: ADA.email, name: 5 }],
+  ];
+  for (const [label, customer] of bad) {
+    const r = await post({ event_id: EVENT, quantity: 1, ...customer });
+    assert.equal(r.statusCode, 400, label);
+    assert.equal(r.json<Body>().error, 'invalid_request', label);
+  }
+  assert.equal(calls.length, 0);
+  assert.equal(await bookingCount(), 0);
+  // the limits are inclusive
+  assert.equal((await post({ event_id: EVENT, quantity: 1, email: at('a'.repeat(242)), name: 'x'.repeat(100) })).statusCode, 202);
+});
+
+test('email is stored trimmed and lowercased, name trimmed', async () => {
+  const r = await post({ event_id: EVENT, quantity: 2, email: '  Ada@Example.COM ', name: '  Ada Lovelace  ' });
+  assert.equal(r.statusCode, 202);
+  const b = r.json<Body>().booking;
+  assert.equal(b.email, 'ada@example.com');
+  assert.equal(b.name, 'Ada Lovelace');
+  assert.equal((await db.get(b.id))?.email, 'ada@example.com');
+  assert.deepEqual(published, [['payment.requested', { booking_id: b.id, email: 'ada@example.com', event_id: EVENT, amount_cents: 300000 }]]);
+});
+
+test('POST /events needs no auth', async () => {
+  const ev = { id: EVENT, name: 'n', capacity: 5, available: 5, held: 0, sold: 0, price_cents: '100', created_at: '' };
+  behavior.CreateEvent = () => ({ event: ev });
+  const r = await app.inject({ method: 'POST', url: '/events', payload: { name: 'n', capacity: 5, price_cents: 100 } });
+  assert.equal(r.statusCode, 201);
+  assert.deepEqual(calls, [['CreateEvent', { name: 'n', capacity: 5, price_cents: 100 }]]);
+});
+
+test('GET /bookings?email= lists only that customer, newest first, case-insensitively', async () => {
+  const first = await create();
+  const second = await create();
+  await post({ event_id: EVENT, quantity: 1, ...BOB });
+  const p = new pg.Client(URL); await p.connect();
+  await p.query(`UPDATE bookings SET created_at = now() - interval '1 minute' WHERE id=$1`, [first.id]); await p.end();
+  const r = await listFor(' ADA@example.com ');
+  assert.equal(r.statusCode, 200);
+  assert.deepEqual(r.json<Body>().bookings.map((b) => b.id), [second.id, first.id]);
+  assert.deepEqual((await listFor('nobody@example.com')).json<Body>().bookings, []);
+});
+
+test('GET /bookings without a valid email -> 400 invalid_request', async () => {
+  for (const url of ['/bookings', '/bookings?email=', '/bookings?email=nope', `/bookings?email=${'a'.repeat(250)}@example.com`]) {
+    const r = await app.inject(url);
+    assert.equal(r.statusCode, 400, url);
+    assert.equal(r.json<Body>().error, 'invalid_request', url);
+  }
 });
 
 test('POST /bookings -> 202 PENDING and publishes payment.requested', async () => {
-  const r = await post({ event_id: EVENT, quantity: 2 });
+  const r = await post({ event_id: EVENT, quantity: 2, ...ADA });
   assert.equal(r.statusCode, 202);
   const b = r.json<Body>().booking;
   assert.equal(b.status, 'PENDING');
   assert.equal(b.amount_cents, 300000);
-  assert.deepEqual(published, [['payment.requested', { booking_id: b.id, user_id: 'u1', event_id: EVENT, amount_cents: 300000 }]]);
+  assert.deepEqual(published, [['payment.requested', { booking_id: b.id, email: ADA.email, event_id: EVENT, amount_cents: 300000 }]]);
 });
 
 test('publish failure releases seats and marks FAILED', async () => {
   behavior.publish = new Error('broker down');
-  const r = await post({ event_id: EVENT, quantity: 2 });
+  const r = await post({ event_id: EVENT, quantity: 2, ...ADA });
   assert.equal(r.statusCode, 500);
-  const [b] = await db.listByUser('u1');
+  const [b] = await db.listByEmail(ADA.email);
   assert.equal(b?.status, 'FAILED');
   assert.ok(calls.some(([n]) => n === 'ReleaseSeats'));
 });
@@ -277,20 +329,31 @@ test('20 concurrent same-key requests converge on one booking', async () => {
 });
 
 test('same key with a different body -> 422 idempotency_key_reused', async () => {
-  assert.equal((await keyed('k1', 'good', 2)).statusCode, 202);
-  const r = await keyed('k1', 'good', 3);
+  assert.equal((await keyed('k1', ADA, 2)).statusCode, 202);
+  const r = await keyed('k1', ADA, 3);
   assert.equal(r.statusCode, 422);
   assert.equal(r.json<Body>().error, 'idempotency_key_reused');
   assert.equal(await bookingCount(), 1);
 });
 
-test('same key from a different user -> independent bookings', async () => {
-  const a = await keyed('k1', 'good');
-  const b = await keyed('k1', 'good2');
+test('same key with another email -> independent bookings', async () => {
+  const a = await keyed('k1', ADA);
+  const b = await keyed('k1', BOB);
   assert.equal(a.statusCode, 202);
   assert.equal(b.statusCode, 202);
   assert.notEqual(a.json<Body>().booking.id, b.json<Body>().booking.id);
-  assert.equal(b.json<Body>().booking.user_id, 'u2');
+  assert.equal(b.json<Body>().booking.email, BOB.email);
+});
+
+test('same key with an upper-cased, padded email and name -> same customer, 200 replay', async () => {
+  const a = await keyed('k1', ADA);
+  const b = await keyed('k1', { email: ' ADA@EXAMPLE.COM', name: ' Ada ' });
+  assert.equal(a.statusCode, 202);
+  assert.equal(b.statusCode, 200);
+  assert.equal(b.json<Body>().booking.id, a.json<Body>().booking.id);
+  const c = await keyed('k1', { email: ADA.email, name: 'Ada L' }); // name is part of the request hash
+  assert.equal(c.statusCode, 422);
+  assert.equal(await bookingCount(), 1);
 });
 
 test('bad Idempotency-Key -> 400 invalid_idempotency_key', async () => {
@@ -428,3 +491,81 @@ test('booking row gone during confirm -> requeue, no refund', async () => {
 // An RPC request must name every field: proto3 would send a missing one as '' or 0.
 // @ts-expect-error booking_id is missing
 const _missingField = (c: Clients) => c.event.ConfirmSeats({});
+
+// The auth-era schema, verbatim from before the email/name change.
+const AUTH_ERA_SCHEMA = `
+CREATE TABLE bookings (
+  id uuid PRIMARY KEY,
+  user_id text NOT NULL,
+  event_id uuid NOT NULL,
+  quantity int NOT NULL,
+  amount_cents bigint NOT NULL,
+  status text NOT NULL CHECK (status IN ('PENDING','CONFIRMED','FAILED','EXPIRED')),
+  payment_id uuid,
+  expires_at timestamptz NOT NULL,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+CREATE INDEX bookings_user_idx ON bookings (user_id);
+CREATE INDEX bookings_status_exp_idx ON bookings (status, expires_at);
+CREATE TABLE idempotency_keys (
+  user_id text NOT NULL,
+  key text NOT NULL,
+  request_hash text NOT NULL,
+  booking_id uuid NOT NULL,
+  created_at timestamptz DEFAULT now(),
+  PRIMARY KEY (user_id, key)
+);
+CREATE INDEX idempotency_keys_created_idx ON idempotency_keys (created_at);`;
+
+// Runs fn against a fresh scratch database, created with the given SQL and dropped afterwards.
+async function withScratchDb(setup: string, fn: (scratch: Db, p: pg.Client) => Promise<void>) {
+  const name = 'booking_migration_test';
+  const admin = new pg.Client(ADMIN); await admin.connect();
+  await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
+  await admin.query(`CREATE DATABASE ${name}`);
+  const url = `postgres://postgres:postgres@localhost:5432/${name}`;
+  const p = new pg.Client(url); await p.connect();
+  const scratch = createDb(url);
+  try {
+    await p.query(setup);
+    await fn(scratch, p);
+  } finally {
+    await scratch.close(); await p.end();
+    await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`); await admin.end();
+  }
+}
+const columns = async (p: pg.Client, table: string) => (await p.query<{ column_name: string }>(
+  `SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 ORDER BY ordinal_position`, [table])).rows.map((r) => r.column_name);
+const indexes = async (p: pg.Client) =>
+  (await p.query<{ indexname: string }>(`SELECT indexname FROM pg_indexes WHERE tablename='bookings' ORDER BY indexname`)).rows.map((r) => r.indexname);
+
+test('startup migration upgrades an auth-era database in place, and a second run is a no-op', async () => {
+  const OLD = '33333333-3333-4333-8333-333333333333';
+  await withScratchDb(`${AUTH_ERA_SCHEMA}
+    INSERT INTO bookings (id,user_id,event_id,quantity,amount_cents,status,expires_at) VALUES ('${OLD}','u-old','${EVENT}',2,300000,'CONFIRMED',now());
+    INSERT INTO idempotency_keys (user_id,key,request_hash,booking_id) VALUES ('u-old','k-old','h','${OLD}');`, async (scratch, p) => {
+    await scratch.init();
+    await scratch.init();
+    const b = await scratch.get(OLD);
+    assert.equal(b?.email, 'u-old');
+    assert.equal(b?.name, '');
+    assert.equal(b?.status, 'CONFIRMED');
+    assert.deepEqual(await columns(p, 'idempotency_keys'), ['email', 'key', 'request_hash', 'booking_id', 'created_at']);
+    // the primary key followed the rename: the old key still binds the old booking
+    assert.equal((await scratch.claimKey('u-old', 'k-old', 'h', randomUUID())).booking_id, OLD);
+    assert.deepEqual(await indexes(p), ['bookings_email_idx', 'bookings_pkey', 'bookings_status_exp_idx']);
+    await scratch.insert({ id: randomUUID(), email: ADA.email, name: ADA.name, event_id: EVENT, quantity: 1, amount_cents: 150000, expires_at: new Date().toISOString() });
+    assert.equal((await scratch.listByEmail(ADA.email))[0]?.name, ADA.name);
+  });
+});
+
+test('startup schema on a fresh database creates the email/name shape, and a second run is a no-op', async () => {
+  await withScratchDb('SELECT 1', async (scratch, p) => {
+    await scratch.init();
+    await scratch.init();
+    assert.deepEqual(await columns(p, 'bookings'), ['id', 'email', 'name', 'event_id', 'quantity', 'amount_cents', 'status', 'payment_id', 'expires_at', 'created_at', 'updated_at']);
+    assert.deepEqual(await columns(p, 'idempotency_keys'), ['email', 'key', 'request_hash', 'booking_id', 'created_at']);
+    assert.deepEqual(await indexes(p), ['bookings_email_idx', 'bookings_pkey', 'bookings_status_exp_idx']);
+  });
+});

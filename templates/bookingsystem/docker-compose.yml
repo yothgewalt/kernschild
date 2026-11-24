@@ -40,22 +40,6 @@ services:
       timeout: 3s
       retries: 30
 
-  auth:
-    build: ./apps/auth-service
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "/app", "healthcheck"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
-    environment:
-      GRPC_ADDR: ":50051"
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/auth?sslmode=disable
-      JWT_SECRET: ${JWT_SECRET:-dev-only-secret-change-me}
-    ports: ["50051:50051"]
-    depends_on:
-      postgres: { condition: service_healthy }
-
   event:
     build: ./apps/event-service
     restart: unless-stopped
@@ -103,14 +87,12 @@ services:
       <<: *common-env
       HTTP_PORT: "3000"
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/booking
-      AUTH_ADDR: auth:50051
       EVENT_ADDR: event:50052
       PAYMENT_ADDR: payment:50053
     ports: ["3000:3000"]
     depends_on:
       postgres: { condition: service_healthy }
       rabbitmq: { condition: service_healthy }
-      auth: { condition: service_healthy }
       event: { condition: service_healthy }
       payment: { condition: service_healthy }
     healthcheck:

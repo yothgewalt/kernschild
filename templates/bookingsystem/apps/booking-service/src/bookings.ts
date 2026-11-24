@@ -6,7 +6,7 @@ import type { Clients } from './grpc.ts';
 import type { Db } from './db.ts';
 import type { Mq } from './mq.ts';
 import { errorMessage, isPaymentResult } from './types.ts';
-import type { AuthedUser, Booking, BookingStatus, RefundReason } from './types.ts';
+import type { Booking, BookingStatus, Customer, RefundReason } from './types.ts';
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
 const KEY_SWEEP_MS = 60_000;
@@ -16,21 +16,21 @@ const httpError = (status: number, error: string, message: string): HttpError =>
   Object.assign(new Error(message), { statusCode: status, httpError: error });
 
 export type Verdict = 'ack' | 'requeue';
-export interface BookingRequest { event_id: string; quantity: number }
+export interface BookingRequest extends Customer { event_id: string; quantity: number }
 export type Bookings = ReturnType<typeof createBookings>;
 
 export function createBookings({ db, grpc, mq }: { db: Db; grpc: Clients; mq: Pick<Mq, 'publish'> }) {
   let lastKeySweep = 0;
-  const requestPayment = (b: Pick<Booking, 'id' | 'user_id' | 'event_id' | 'amount_cents'>) =>
-    mq.publish('payment.requested', { booking_id: b.id, user_id: b.user_id, event_id: b.event_id, amount_cents: b.amount_cents });
+  const requestPayment = (b: Pick<Booking, 'id' | 'email' | 'event_id' | 'amount_cents'>) =>
+    mq.publish('payment.requested', { booking_id: b.id, email: b.email, event_id: b.event_id, amount_cents: b.amount_cents });
 
   const bookings = {
     // Returns { booking, replayed }. With an idempotency key, the booking id comes from the stored key.
-    async create(user: AuthedUser, { event_id, quantity }: BookingRequest, key: string | undefined, rebound = false): Promise<{ booking: Booking | undefined; replayed: boolean }> {
+    async create({ event_id, quantity, email, name }: BookingRequest, key: string | undefined, rebound = false): Promise<{ booking: Booking | undefined; replayed: boolean }> {
       let id: string = randomUUID();
       if (key !== undefined) {
-        const hash = createHash('sha256').update(JSON.stringify({ event_id, quantity })).digest('hex');
-        const stored = await db.claimKey(user.user_id, key, hash, id);
+        const hash = createHash('sha256').update(JSON.stringify({ event_id, quantity, email, name })).digest('hex');
+        const stored = await db.claimKey(email, key, hash, id);
         if (stored.request_hash !== hash) throw httpError(422, 'idempotency_key_reused', 'Idempotency-Key was used with a different request');
         id = stored.booking_id;
         const existing = await db.get(id);
@@ -47,10 +47,10 @@ export function createBookings({ db, grpc, mq }: { db: Db; grpc: Clients; mq: Pi
         // ReserveSeats returns it unchanged forever, so rebind the key to a fresh id once.
         if (key === undefined || rebound) throw new Error(`ReserveSeats returned a dead hold for ${id}`);
         log('idempotency key points at a dead hold, rebinding', id);
-        await db.releaseKey(user.user_id, key, id);
-        return bookings.create(user, { event_id, quantity }, key, true);
+        await db.releaseKey(email, key, id);
+        return bookings.create({ event_id, quantity, email, name }, key, true);
       }
-      const b = { id, user_id: user.user_id, event_id, quantity, amount_cents: Number(hold.amount_cents), expires_at: hold.expires_at };
+      const b = { id, email, name, event_id, quantity, amount_cents: Number(hold.amount_cents), expires_at: hold.expires_at };
       try { await db.insert(b); } catch (e) {
         await grpc.event.ReleaseSeats({ booking_id: id }).catch(() => {});
         throw e;

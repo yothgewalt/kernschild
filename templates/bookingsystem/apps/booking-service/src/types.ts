@@ -1,11 +1,10 @@
-import type { ValidateTokenResponse__Output } from './gen/bookingsystem/auth/v1/ValidateTokenResponse.ts';
-
 export type BookingStatus = 'PENDING' | 'CONFIRMED' | 'FAILED' | 'EXPIRED';
 
 // A row of the bookings table, with the bigint amount as a number.
 export interface Booking {
   id: string;
-  user_id: string;
+  email: string;
+  name: string;
   event_id: string;
   quantity: number;
   amount_cents: number;
@@ -16,13 +15,14 @@ export interface Booking {
   updated_at: Date;
 }
 
-export type AuthedUser = ValidateTokenResponse__Output;
+// A customer is the email they book with (trimmed, lowercased) plus a display name; there are no accounts.
+export interface Customer { email: string; name: string }
 
 export type RefundReason = 'hold_expired' | 'booking_not_pending';
 
 // The bodies booking publishes, by routing key.
 export interface Outbox {
-  'payment.requested': { booking_id: string; user_id: string; event_id: string; amount_cents: number };
+  'payment.requested': { booking_id: string; email: string; event_id: string; amount_cents: number };
   'payment.refund.requested': { booking_id: string; payment_id: string; reason: RefundReason };
 }
 

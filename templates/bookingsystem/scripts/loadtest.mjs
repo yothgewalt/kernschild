@@ -1,24 +1,22 @@
 // Fires N concurrent bookings at an event with CAPACITY seats and checks nothing is oversold.
 // Usage: node scripts/loadtest.mjs [N=500] [CAPACITY=100] [USERS=20]
 import assert from 'node:assert/strict';
-import { api, must, newUser, sleep } from './lib.mjs';
+import { api, must, newCustomer, sleep } from './lib.mjs';
 
 const [N = 500, CAPACITY = 100, USERS = 20] = process.argv.slice(2).map(Number);
 
-const users = await Promise.all(Array.from({ length: USERS }, () => newUser('load')));
+const customers = Array.from({ length: USERS }, () => newCustomer('load'));
 const { event } = await must('POST', '/events', {
-  token: users[0].token,
   body: { name: `Load test ${new Date().toISOString()}`, capacity: CAPACITY, price_cents: 5000 },
 });
-console.log(`event ${event.id}: capacity=${CAPACITY}, firing ${N} concurrent bookings from ${USERS} users`);
+console.log(`event ${event.id}: capacity=${CAPACITY}, firing ${N} concurrent bookings from ${USERS} customers`);
 
 const started = performance.now();
 const results = await Promise.all(
   Array.from({ length: N }, async (_, i) => {
     const t0 = performance.now();
     const res = await api('POST', '/bookings', {
-      token: users[i % USERS].token,
-      body: { event_id: event.id, quantity: 1 },
+      body: { event_id: event.id, quantity: 1, ...customers[i % USERS] },
     });
     return { ...res, ms: performance.now() - t0 };
   }),

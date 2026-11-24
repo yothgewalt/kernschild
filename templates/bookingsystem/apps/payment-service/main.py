@@ -25,11 +25,17 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS payments (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   booking_id uuid UNIQUE NOT NULL,
-  user_id text NOT NULL,
+  email text NOT NULL,
   amount_cents bigint NOT NULL,
   status text NOT NULL CHECK (status IN ('PROCESSING','SUCCEEDED','FAILED','REFUNDED')),
   created_at timestamptz DEFAULT now(),
   updated_at timestamptz DEFAULT now());
+DO $$ BEGIN  -- auth-era databases stored the customer as user_id
+  IF EXISTS (SELECT 1 FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'payments' AND column_name = 'user_id') THEN
+    ALTER TABLE payments RENAME COLUMN user_id TO email;
+  END IF;
+END $$;
 ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_status_check,
   ADD CONSTRAINT payments_status_check CHECK (status IN ('PROCESSING','SUCCEEDED','FAILED','REFUNDED'));
 """
@@ -64,17 +70,17 @@ def decide(cfg: Config, rng=random) -> tuple[float, bool]:
 
 
 def parse_request(body: bytes) -> tuple[str, str, int]:
-    """Returns (booking_id, user_id, amount_cents); raises ValueError if malformed."""
+    """Returns (booking_id, email, amount_cents); raises ValueError if malformed."""
     try:
         d = json.loads(body)
         booking_id = str(uuid.UUID(d["booking_id"]))
-        user_id = d["user_id"]
+        email = d["email"]
         amount = d["amount_cents"]
     except (KeyError, TypeError, AttributeError, json.JSONDecodeError, UnicodeDecodeError, RecursionError) as e:
         raise ValueError(f"malformed payment request: {e!r}") from e
-    if not isinstance(user_id, str) or not user_id or type(amount) is not int or amount < 0:
-        raise ValueError("malformed payment request: bad user_id or amount_cents")
-    return booking_id, user_id, amount
+    if not isinstance(email, str) or not email or type(amount) is not int or amount < 0:
+        raise ValueError("malformed payment request: bad email or amount_cents")
+    return booking_id, email, amount
 
 
 def parse_refund(body: bytes) -> tuple[str, str]:
@@ -109,7 +115,7 @@ async def retry(what, fn, tries=30):
 def to_proto(r) -> payment_pb2.Payment:
     ts = lambda t: t.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     return payment_pb2.Payment(
-        id=str(r["id"]), booking_id=str(r["booking_id"]), user_id=r["user_id"],
+        id=str(r["id"]), booking_id=str(r["booking_id"]), email=r["email"],
         amount_cents=r["amount_cents"], status=STATUS[r["status"]],
         created_at=ts(r["created_at"]), updated_at=ts(r["updated_at"]),
     )
@@ -150,7 +156,7 @@ class Processor:
 
     async def handle(self, message: aio_pika.abc.AbstractIncomingMessage):
         try:
-            booking_id, user_id, amount = parse_request(message.body)
+            booking_id, email, amount = parse_request(message.body)
         except ValueError as e:
             log.error("rejecting message: %s", e)
             await message.reject(requeue=False)
@@ -161,7 +167,7 @@ class Processor:
             return
         self.inflight.add(booking_id)
         try:
-            await self.process(booking_id, user_id, amount)
+            await self.process(booking_id, email, amount)
             await message.ack()
         except Exception:
             log.exception("booking %s failed, requeueing", booking_id)
@@ -171,11 +177,11 @@ class Processor:
         finally:
             self.inflight.discard(booking_id)
 
-    async def process(self, booking_id, user_id, amount):
+    async def process(self, booking_id, email, amount):
         bid = uuid.UUID(booking_id)
         row = await self.pool.fetchrow(
-            "INSERT INTO payments (booking_id, user_id, amount_cents, status) VALUES ($1,$2,$3,'PROCESSING') "
-            "ON CONFLICT (booking_id) DO NOTHING RETURNING id", bid, user_id, amount)
+            "INSERT INTO payments (booking_id, email, amount_cents, status) VALUES ($1,$2,$3,'PROCESSING') "
+            "ON CONFLICT (booking_id) DO NOTHING RETURNING id", bid, email, amount)
         if row is None:
             row = await self.pool.fetchrow("SELECT id, status, amount_cents FROM payments WHERE booking_id = $1", bid)
             if row["status"] == "REFUNDED":  # settled and refunded; booking needs nothing more

@@ -1,6 +1,6 @@
 # Booking system demo
 
-A small ticket booking system built as four microservices. Use it to see these patterns
+A small ticket booking system built as three microservices. Use it to see these patterns
 working together:
 
 - gRPC between services
@@ -10,19 +10,19 @@ working together:
 - seat holds that keep a booking `PENDING` while payment runs, and that never oversell
   under a burst of concurrent requests
 
-The payment provider is a mock.
+The payment provider is a mock. There are no accounts: to buy a ticket, a customer gives only
+an email and a name.
 
 | App | Language | Port | Role |
 |---|---|---|---|
 | `apps/booking-service` | TypeScript (Node.js, no build step) | HTTP 3000 | Public HTTP API and orchestrator |
-| `apps/auth-service` | Go | gRPC 50051 | Users, login, JWT validation |
 | `apps/event-service` | Go | gRPC 50052 | Events and seat inventory. Holds live in Redis; events and sales in Postgres |
 | `apps/payment-service` | Python | gRPC 50053 | Mock payment worker (RabbitMQ consumer) and payment lookup |
 
 ## Flow
 
 ```
-client ──HTTP──► booking ──gRPC──► auth      ValidateToken
+client ──HTTP──► booking        POST /bookings {event_id, quantity, email, name}
                     │
                     ├──gRPC──► event         ReserveSeats  → Redis Lua hold (TTL, default 15s)
                     │                         booking saved as PENDING
@@ -45,7 +45,7 @@ task up          # build and start everything, wait until healthy
 task demo        # one booking: PENDING → CONFIRMED or FAILED
 task loadtest    # 500 concurrent bookings for 100 seats; asserts no oversell
 task demo:expiry # make payment slower than the hold and watch the booking expire
-task check       # prove idempotency keys, late-payment refunds and Redis-loss recovery
+task check       # prove email+name booking, idempotency keys, late-payment refunds and Redis-loss recovery
 task stats       # booking counts by status and seat inventory
 task reset       # stop everything and delete the data
 ```
@@ -56,20 +56,29 @@ Run `task` to list all commands. To change the protos, edit them under `proto/` 
 
 ## HTTP API (localhost:3000)
 
+Book a ticket with just an email and a name:
+
+```sh
+EVENT=$(curl -s localhost:3000/events | jq -r '.events[0].id')
+curl -s localhost:3000/bookings -H 'content-type: application/json' \
+  -d "{\"event_id\":\"$EVENT\",\"quantity\":2,\"email\":\"ada@example.com\",\"name\":\"Ada Lovelace\"}" | jq
+curl -s 'localhost:3000/bookings?email=ada@example.com' | jq '.bookings[] | {id, status}'
+```
+
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/auth/register` | `{email, password}` |
-| POST | `/auth/login` | `{email, password}` → `{token}` |
 | GET | `/events`, `/events/:id` | Includes `available`, `held` and `sold` |
-| POST | `/events` | Requires auth. `{name, capacity, price_cents}` |
-| POST | `/bookings` | Requires auth. `{event_id, quantity}` → `202` PENDING, or `409` when sold out. The optional `Idempotency-Key` header makes retries safe: the same key returns the same booking (`200`, `Idempotent-Replayed: true`) |
-| GET | `/bookings` | Requires auth. The caller's bookings |
+| POST | `/events` | `{name, capacity, price_cents}` |
+| POST | `/bookings` | `{event_id, quantity, email, name}` → `202` PENDING, or `409` when sold out. The optional `Idempotency-Key` header makes retries safe: the same key returns the same booking (`200`, `Idempotent-Replayed: true`) |
+| GET | `/bookings?email=` | That customer's bookings, newest first (email matched case-insensitively) |
 | GET | `/bookings/:id` | |
 | GET | `/payments`, `/payments/:bookingId` | Served from the payment service over gRPC |
 | GET | `/stats` | Bookings by status, plus every event's inventory |
 | GET | `/healthz` | |
 
-Send `Authorization: Bearer <token>` on routes that require auth. Responses over 1 KiB are
+There is no authentication. The email (trimmed and lowercased) identifies the customer, and
+`email` must be a valid address while `name` must be 1–100 characters. Bad input gets `400`.
+Responses over 1 KiB are
 compressed (gzip, br or deflate) when the request's `Accept-Encoding` allows it. You can watch the queues
 in the RabbitMQ UI at http://localhost:15672 (`guest`/`guest`).
 
@@ -87,7 +96,7 @@ in the RabbitMQ UI at http://localhost:15672 (`guest`/`guest`).
 - **Idempotency.** Holds and payments are keyed by booking id, so retries and redelivered
   messages don't double-book or double-charge. Booking status changes only out of `PENDING`,
   so late or duplicate results are ignored. A client `Idempotency-Key` maps to one booking id
-  per user, so even concurrent retries converge on one booking and one hold. Reusing a key
+  per customer email, so even concurrent retries converge on one booking and one hold. Reusing a key
   with a different body returns `422`.
 - **Refunds.** A payment that succeeds after its booking expired or failed is refunded. The
   booking service publishes `payment.refund.requested`, and the payment service marks the
@@ -112,7 +121,6 @@ Set these in the environment before `task up`, or use them as `task` variables w
 | `PAYMENT_MIN_DELAY`, `PAYMENT_MAX_DELAY` | `2`, `6` | Mock payment duration (seconds) |
 | `PAYMENT_SUCCESS_RATE` | `0.8` | Fraction of payments that succeed |
 | `PAYMENT_CONCURRENCY` | `200` | Payment messages processed in parallel |
-| `JWT_SECRET` | dev value | Token signing key |
 | `N`, `CAPACITY`, `USERS` (task vars) | `500`, `100`, `20` | Load test shape, for example `task loadtest N=2000 CAPACITY=300` |
 
 `CONTRACTS.md` has the full service contracts: tables, queues, message bodies and error
@@ -122,5 +130,5 @@ mapping.
 
 Each app under `apps/` is self-contained. It has its own dependencies, Dockerfile and
 generated code. The only shared input is `proto/`, and `task gen` regenerates every app's
-copy from it. `deploy/postgres/init.sql` creates the four databases. `scripts/` holds the
+copy from it. `deploy/postgres/init.sql` creates the three databases. `scripts/` holds the
 demo and load-test clients.

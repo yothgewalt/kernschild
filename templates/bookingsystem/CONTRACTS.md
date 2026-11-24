@@ -8,7 +8,7 @@ RabbitMQ topology, message bodies and the HTTP API.
 
 Everything runs under `docker compose` (see `docker-compose.yml`). For local
 testing, Postgres listens on `localhost:5432` (user/password `postgres`/`postgres`,
-databases `auth`, `event`, `booking`, `payment`). RabbitMQ listens on
+databases `event`, `booking`, `payment`). RabbitMQ listens on
 `localhost:5672` (`guest`/`guest`). Redis listens on `localhost:6379` (AOF on, used by event only).
 
 Every service must:
@@ -22,19 +22,6 @@ Every service must:
 - Use timestamps in RFC 3339 UTC in all proto string fields.
 - Map errors to gRPC codes: bad input → `INVALID_ARGUMENT`, missing → `NOT_FOUND`,
   duplicate → `ALREADY_EXISTS`, and so on.
-
-## auth (Go, `apps/auth-service`, gRPC `GRPC_ADDR` default `:50051`)
-
-Env: `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/auth?sslmode=disable`),
-`JWT_SECRET` (default `dev-only-secret-change-me`), `TOKEN_TTL` (default `24h`).
-
-Table `users(id uuid pk default gen_random_uuid(), email text unique not null, password_hash text not null, created_at timestamptz default now())`.
-
-- `Register`: requires an email containing `@` and a password of at least 6 chars. Stores a bcrypt
-  hash. A duplicate email returns `ALREADY_EXISTS`. Emails are lowercased and trimmed.
-- `Login`: on a wrong email or password returns `UNAUTHENTICATED`. Returns an HS256 JWT
-  with `sub`=user id, `email`, `exp`.
-- `ValidateToken`: verifies the signature, alg (HS256 only) and expiry, else returns `UNAUTHENTICATED`.
 
 ## event (Go, `apps/event-service`, gRPC `GRPC_ADDR` default `:50052`)
 
@@ -158,7 +145,7 @@ Env: `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/paymen
 float, default 2), `PAYMENT_MAX_DELAY` (default 6), `PAYMENT_SUCCESS_RATE` (default 0.8),
 `PAYMENT_CONCURRENCY` (RabbitMQ prefetch, default 200).
 
-Table `payments(id uuid pk default gen_random_uuid(), booking_id uuid unique not null, user_id text not null, amount_cents bigint not null, status text not null check (status in ('PROCESSING','SUCCEEDED','FAILED','REFUNDED')), created_at timestamptz default now(), updated_at timestamptz default now())`.
+Table `payments(id uuid pk default gen_random_uuid(), booking_id uuid unique not null, email text not null, amount_cents bigint not null, status text not null check (status in ('PROCESSING','SUCCEEDED','FAILED','REFUNDED')), created_at timestamptz default now(), updated_at timestamptz default now())`.
 
 The consumer is a mock payment processor. It uses asyncio and handles up to PAYMENT_CONCURRENCY
 messages at once:
@@ -178,6 +165,7 @@ On a malformed message, log it and `reject(requeue=False)`.
 
 Because an older database has the 3-value check, migrate it idempotently at startup:
 `ALTER TABLE payments DROP CONSTRAINT IF EXISTS payments_status_check, ADD CONSTRAINT payments_status_check CHECK (status in ('PROCESSING','SUCCEEDED','FAILED','REFUNDED'))`.
+Also, if `payments.user_id` still exists from the auth-era schema, rename it to `email` (idempotent, at startup).
 
 **Refund consumer** on queue `payment.refunds` (same prefetch and manual ack):
 
@@ -210,7 +198,9 @@ Both sides declare it idempotently with the same arguments:
   Consumers use manual ack and prefetch.
 
 `payment.requested` body:
-`{"booking_id": "<uuid>", "user_id": "<uuid>", "event_id": "<uuid>", "amount_cents": 300000}`
+`{"booking_id": "<uuid>", "email": "ada@example.com", "event_id": "<uuid>", "amount_cents": 300000}`
+
+The `email` field is the customer's email. A request without a non-empty string email is malformed.
 
 `payment.completed` / `payment.failed` body:
 `{"booking_id": "<uuid>", "payment_id": "<uuid>", "status": "SUCCEEDED"|"FAILED", "amount_cents": 300000}`
@@ -218,34 +208,53 @@ Both sides declare it idempotently with the same arguments:
 `payment.refund.requested` body:
 `{"booking_id": "<uuid>", "payment_id": "<uuid>", "reason": "hold_expired"|"booking_not_pending"}`
 
-## booking (Node.js, `apps/booking-service`, HTTP `HTTP_PORT` default 3000)
+## booking (TypeScript on Node.js, `apps/booking-service`, HTTP `HTTP_PORT` default 3000)
 
-This is the public HTTP API. It calls the other services over gRPC, using `@grpc/grpc-js` and
+This is the public HTTP API. It has **no authentication**: a customer is identified only by
+the email given when booking (trimmed and lowercased), together with a display name. It calls
+the other services over gRPC, using `@grpc/grpc-js` and
 `@grpc/proto-loader` to load `${PROTO_DIR}/bookingsystem/*/v1/*.proto` at runtime. `PROTO_DIR`
 defaults to the `proto/` copy inside the app, which `task gen` exports with `buf export`.
 
 Env: `DATABASE_URL` (default `postgres://postgres:postgres@localhost:5432/booking`), `RABBITMQ_URL`,
-`AUTH_ADDR` (`localhost:50051`), `EVENT_ADDR` (`localhost:50052`), `PAYMENT_ADDR` (`localhost:50053`),
+`EVENT_ADDR` (`localhost:50052`), `PAYMENT_ADDR` (`localhost:50053`),
 `SWEEP_INTERVAL_MS` (1000).
 
-Table `bookings(id uuid pk, user_id text not null, event_id uuid not null, quantity int not null, amount_cents bigint not null, status text not null check (status in ('PENDING','CONFIRMED','FAILED','EXPIRED')), payment_id uuid, expires_at timestamptz not null, created_at timestamptz default now(), updated_at timestamptz default now())`
-plus indexes on `(user_id)` and `(status, expires_at)`.
+Table `bookings(id uuid pk, email text not null, name text not null, event_id uuid not null, quantity int not null, amount_cents bigint not null, status text not null check (status in ('PENDING','CONFIRMED','FAILED','EXPIRED')), payment_id uuid, expires_at timestamptz not null, created_at timestamptz default now(), updated_at timestamptz default now())`
+plus indexes on `(email)` and `(status, expires_at)`.
 
-Table `idempotency_keys(user_id text not null, key text not null, request_hash text not null, booking_id uuid not null, created_at timestamptz default now(), primary key (user_id, key))`
+Table `idempotency_keys(email text not null, key text not null, request_hash text not null, booking_id uuid not null, created_at timestamptz default now(), primary key (email, key))`
 plus an index on `(created_at)`.
+
+Upgrade from the auth-era schema. At startup, idempotently and before anything uses the
+tables:
+
+- If `bookings.user_id` exists, rename it to `email` and add `name text not null default ''`.
+- If `idempotency_keys.user_id` exists, rename it to `email`. A primary key follows the
+  column rename automatically.
+
+Old rows keep the old user id in `email`. A fresh database creates the new shape directly.
 
 Status machine: `PENDING → CONFIRMED | FAILED | EXPIRED`. Every transition is
 `UPDATE ... WHERE id=$1 AND status='PENDING'`, so a late or duplicate message is a no-op.
 
-- `POST /bookings {event_id, quantity}` (auth). The optional header is `Idempotency-Key`,
-  1..200 printable ASCII chars, otherwise 400 `invalid_idempotency_key`.
+- `POST /bookings {event_id, quantity, email, name}`. No auth header. Validation is in the
+  JSON schema, and a failure → 400 `invalid_request`:
+  - `event_id`: string
+  - `quantity`: integer, 1..10 (event re-checks it)
+  - `email`: string, `format: email`, at most 254 chars, stored trimmed and lowercased
+  - `name`: string, 1..100 chars, and not blank after trimming; stored trimmed
+
+  The optional header is `Idempotency-Key`, 1..200 printable ASCII chars, otherwise 400
+  `invalid_idempotency_key`.
   1. Choose the booking id.
      - Without the header, use `crypto.randomUUID()`.
      - With the header:
-       - Compute `request_hash = sha256(JSON.stringify({event_id, quantity}))`.
-       - Run `INSERT INTO idempotency_keys (user_id, key, request_hash, booking_id) VALUES (...,randomUUID()) ON CONFLICT DO NOTHING`,
-         then `SELECT request_hash, booking_id`. Keys are scoped per user, so another user's
-         key never collides.
+       - Compute `request_hash = sha256(JSON.stringify({event_id, quantity, email, name}))`,
+         using the normalized email and name.
+       - Run `INSERT INTO idempotency_keys (email, key, request_hash, booking_id) VALUES (...,randomUUID()) ON CONFLICT DO NOTHING`,
+         then `SELECT request_hash, booking_id`. Keys are scoped per customer email, so
+         another customer's key never collides.
        - A different `request_hash` → 422 `idempotency_key_reused`.
        - Otherwise use the stored `booking_id`.
        - If that booking row already exists, this is a replay:
@@ -291,27 +300,23 @@ Status machine: `PENDING → CONFIRMED | FAILED | EXPIRED`. Every transition is
   - Otherwise, transition it to EXPIRED.
 
   This order means booking never expires a booking whose seats event already sold.
-- Auth header: `Authorization: Bearer <token>`. Validate via `Auth.ValidateToken`.
-  `UNAUTHENTICATED` → 401.
 
 HTTP API (JSON; error bodies are `{"error": "<snake_case>", "message": "..."}`):
 
-| Method | Path | Auth | Calls |
-|---|---|---|---|
-| POST | /auth/register `{email,password}` | – | Auth.Register → 201 `{user}` |
-| POST | /auth/login `{email,password}` | – | Auth.Login → 200 `{token, expires_at, user}` |
-| GET | /events | – | Event.ListEvents → `{events}` |
-| GET | /events/:id | – | Event.GetEvent → `{event}` |
-| POST | /events `{name, capacity, price_cents}` | yes | Event.CreateEvent → 201 `{event}` |
-| POST | /bookings `{event_id, quantity}` (+ optional `Idempotency-Key` header) | yes | see above → 202 `{booking}` (200 on replay) |
-| GET | /bookings | yes | the caller's bookings, newest first → `{bookings}` |
-| GET | /bookings/:id | – | `{booking}` (404 if missing) |
-| GET | /payments?limit= | – | Payment.ListPayments → `{payments}` |
-| GET | /payments/:bookingId | – | Payment.GetPayment → `{payment}` |
-| GET | /stats | – | `{bookings: {PENDING:n, CONFIRMED:n, FAILED:n, EXPIRED:n}, events: [Event...]}` |
-| GET | /healthz | – | 200 `{ok:true}` when DB + RabbitMQ are connected, else 503 |
+| Method | Path | Calls |
+|---|---|---|
+| GET | /events | Event.ListEvents → `{events}` |
+| GET | /events/:id | Event.GetEvent → `{event}` |
+| POST | /events `{name, capacity, price_cents}` | Event.CreateEvent → 201 `{event}` |
+| POST | /bookings `{event_id, quantity, email, name}` (+ optional `Idempotency-Key` header) | see above → 202 `{booking}` (200 on replay) |
+| GET | /bookings?email= | that customer's bookings, newest first, matched case-insensitively → `{bookings}`. `email` is required and validated like the POST field (400 otherwise) |
+| GET | /bookings/:id | `{booking}` (404 if missing) |
+| GET | /payments?limit= | Payment.ListPayments → `{payments}` |
+| GET | /payments/:bookingId | Payment.GetPayment → `{payment}` |
+| GET | /stats | `{bookings: {PENDING:n, CONFIRMED:n, FAILED:n, EXPIRED:n}, events: [Event...]}` |
+| GET | /healthz | 200 `{ok:true}` when DB + RabbitMQ are connected, else 503 |
 
-Booking JSON uses snake_case fields that mirror the table columns. Proto enums are rendered as
+Booking JSON uses snake_case fields that mirror the table columns: `id, email, name, event_id, quantity, amount_cents, status, payment_id, expires_at, created_at, updated_at`. Proto enums are rendered as
 strings without their prefix: `PAYMENT_STATUS_SUCCEEDED` → `"SUCCEEDED"`. Every gRPC call has
 a deadline of 5s and fails fast (UNAVAILABLE, mapped to 503) while a peer is down. Clients re-resolve DNS after
 1s and cap reconnect backoff at 2s, so a recreated peer with a new IP is reachable again within seconds.
@@ -321,5 +326,5 @@ a deadline of 5s and fails fast (UNAVAILABLE, mapped to 503) while a peer is dow
 Each app under `apps/` is self-contained, as if it were its own repo. Each one has its own
 module or package file, its own Dockerfile (the build context is the app dir), and its own
 generated code. The only shared input is `proto/`. `task gen` regenerates every app's copy:
-Go into `apps/{auth,event}-service/gen`, Python into `apps/payment-service/gen`, and the raw
+Go into `apps/event-service/gen`, Python into `apps/payment-service/gen`, and the raw
 `.proto` files into `apps/booking-service/proto`.

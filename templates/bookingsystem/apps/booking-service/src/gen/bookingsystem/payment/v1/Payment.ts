@@ -6,7 +6,7 @@ import type { Long } from '@grpc/proto-loader';
 export interface Payment {
   'id'?: (string);
   'booking_id'?: (string);
-  'user_id'?: (string);
+  'email'?: (string);
   'amount_cents'?: (number | string | Long);
   'status'?: (_bookingsystem_payment_v1_PaymentStatus);
   'created_at'?: (string);
@@ -16,7 +16,7 @@ export interface Payment {
 export interface Payment__Output {
   'id': (string);
   'booking_id': (string);
-  'user_id': (string);
+  'email': (string);
   'amount_cents': (string);
   'status': (_bookingsystem_payment_v1_PaymentStatus__Output);
   'created_at': (string);

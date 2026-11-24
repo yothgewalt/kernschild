@@ -21,22 +21,22 @@ PAYMENT_STATUS_FAILED: PaymentStatus
 PAYMENT_STATUS_REFUNDED: PaymentStatus
 
 class Payment(_message.Message):
-    __slots__ = ("id", "booking_id", "user_id", "amount_cents", "status", "created_at", "updated_at")
+    __slots__ = ("id", "booking_id", "email", "amount_cents", "status", "created_at", "updated_at")
     ID_FIELD_NUMBER: _ClassVar[int]
     BOOKING_ID_FIELD_NUMBER: _ClassVar[int]
-    USER_ID_FIELD_NUMBER: _ClassVar[int]
+    EMAIL_FIELD_NUMBER: _ClassVar[int]
     AMOUNT_CENTS_FIELD_NUMBER: _ClassVar[int]
     STATUS_FIELD_NUMBER: _ClassVar[int]
     CREATED_AT_FIELD_NUMBER: _ClassVar[int]
     UPDATED_AT_FIELD_NUMBER: _ClassVar[int]
     id: str
     booking_id: str
-    user_id: str
+    email: str
     amount_cents: int
     status: PaymentStatus
     created_at: str
     updated_at: str
-    def __init__(self, id: _Optional[str] = ..., booking_id: _Optional[str] = ..., user_id: _Optional[str] = ..., amount_cents: _Optional[int] = ..., status: _Optional[_Union[PaymentStatus, str]] = ..., created_at: _Optional[str] = ..., updated_at: _Optional[str] = ...) -> None: ...
+    def __init__(self, id: _Optional[str] = ..., booking_id: _Optional[str] = ..., email: _Optional[str] = ..., amount_cents: _Optional[int] = ..., status: _Optional[_Union[PaymentStatus, str]] = ..., created_at: _Optional[str] = ..., updated_at: _Optional[str] = ...) -> None: ...
 
 class GetPaymentRequest(_message.Message):
     __slots__ = ("booking_id",)

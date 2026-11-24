@@ -5,7 +5,7 @@ version: '3'
 vars:
   N: 500        # loadtest: concurrent booking requests
   CAPACITY: 100 # loadtest: seats in the fresh event
-  USERS: 20     # loadtest: distinct users sending them
+  USERS: 20     # loadtest: distinct customer emails sending them
 
 tasks:
   default:
@@ -18,7 +18,7 @@ tasks:
     desc: Lint protos, regenerate each app's gRPC code (Go, Python) and export .proto files for the Node app
     cmds:
       - buf lint
-      - for: [auth-service, event-service, payment-service]
+      - for: [event-service, payment-service]
         cmd: cd apps/{{.ITEM}} && buf generate
       - rm -rf apps/booking-service/proto && buf export proto --output apps/booking-service/proto
       - cd apps/booking-service && rm -rf src/gen && ./node_modules/.bin/proto-loader-gen-types --keepCase --longs=String --enums=String --defaults --grpcLib=@grpc/grpc-js --importFileExtension=.ts -O src/gen proto/bookingsystem/*/v1/*.proto
@@ -26,8 +26,7 @@ tasks:
   tidy:
     desc: Install/refresh local dependencies for all services
     cmds:
-      - for: [auth-service, event-service]
-        cmd: cd apps/{{.ITEM}} && go mod tidy
+      - cd apps/event-service && go mod tidy
       - npm install --prefix apps/booking-service
       - uv sync --directory apps/payment-service
 
@@ -43,8 +42,7 @@ tasks:
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/event_test?sslmode=disable
       TEST_REDIS_URL: redis://localhost:6379/15
     cmds:
-      - for: [auth-service, event-service]
-        cmd: cd apps/{{.ITEM}} && go vet ./... && go test -race -count=1 ./...
+      - cd apps/event-service && go vet ./... && go test -race -count=1 ./...
       - npm ci --prefix apps/booking-service --no-audit --no-fund
       - npm run typecheck --prefix apps/booking-service
       - npm test --prefix apps/booking-service
@@ -58,11 +56,11 @@ tasks:
   up:
     desc: Build and start the whole system, waiting until it is healthy
     cmds:
-      - docker compose up -d --build --wait
+      - docker compose up -d --build --wait --remove-orphans # drops the old auth container on upgrade
       - cmd: |
           echo "booking API      http://localhost:3000  (try: task demo)"
           echo "RabbitMQ UI      http://localhost:15672 (guest/guest)"
-          echo "gRPC             auth :50051  event :50052  payment :50053"
+          echo "gRPC             event :50052  payment :50053"
         silent: true
 
   down:
@@ -98,8 +96,9 @@ tasks:
       - node scripts/demo.mjs
 
   check:
-    desc: Prove idempotent bookings, late-payment refunds and Redis-loss recovery end to end
+    desc: Prove email+name booking, idempotent bookings, late-payment refunds and Redis-loss recovery end to end
     cmds:
+      - node scripts/check.mjs customer
       - node scripts/check.mjs idempotency
       - defer: docker compose up -d --wait event payment
       - HOLD_TTL=5s PAYMENT_MIN_DELAY=8 PAYMENT_MAX_DELAY=10 PAYMENT_SUCCESS_RATE=1 docker compose up -d --wait event payment

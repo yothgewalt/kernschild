@@ -1,19 +1,20 @@
-// End-to-end checks for idempotent bookings, late-payment refunds and Redis-loss recovery.
-// Usage: node scripts/check.mjs idempotency|refund|redis-loss  (task check runs all three
+// End-to-end checks for email+name customers, idempotent bookings, late-payment refunds and
+// Redis-loss recovery.
+// Usage: node scripts/check.mjs customer|idempotency|refund|redis-loss  (task check runs all
 // with the service settings each one needs).
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { BASE, api, must, newUser, sleep } from './lib.mjs';
+import { BASE, api, must, newCustomer, sleep } from './lib.mjs';
 
-const checks = { idempotency, refund, 'redis-loss': redisLoss };
+const checks = { customer, idempotency, refund, 'redis-loss': redisLoss };
 const name = process.argv[2];
 if (!checks[name]) throw new Error(`usage: check.mjs ${Object.keys(checks).join('|')}`);
 await checks[name]();
 console.log(`OK: ${name}`);
 
-async function newEvent(token, capacity) {
+async function newEvent(capacity) {
   const body = { name: `check ${name} ${crypto.randomUUID().slice(0, 8)}`, capacity, price_cents: 1000 };
-  return (await must('POST', '/events', { token, body })).event;
+  return (await must('POST', '/events', { body })).event;
 }
 
 async function eventNow(id) {
@@ -29,21 +30,47 @@ async function until(label, fn, seconds = 60) {
   throw new Error(`timed out waiting for ${label}`);
 }
 
-function post(token, key, body) {
+function post(key, body) {
   return fetch(`${BASE}/bookings`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', authorization: `Bearer ${token}`, 'idempotency-key': key },
+    headers: { 'content-type': 'application/json', 'idempotency-key': key },
     body: JSON.stringify(body),
   }).then(async (r) => ({ status: r.status, replayed: r.headers.get('idempotent-replayed'), body: await r.json() }));
 }
 
-async function idempotency() {
-  const { token } = await newUser('idem');
-  const event = await newEvent(token, 5);
-  const key = crypto.randomUUID();
-  const body = { event_id: event.id, quantity: 2 };
+// Booking needs only an email and a name; both are validated, and email identifies the customer.
+async function customer() {
+  const event = await newEvent(5);
+  const who = newCustomer('cust');
+  const bad = [
+    ['missing email', { event_id: event.id, quantity: 1, name: who.name }],
+    ['invalid email', { event_id: event.id, quantity: 1, name: who.name, email: 'not-an-email' }],
+    ['missing name', { event_id: event.id, quantity: 1, email: who.email }],
+    ['blank name', { event_id: event.id, quantity: 1, email: who.email, name: '   ' }],
+  ];
+  for (const [label, body] of bad) {
+    const r = await api('POST', '/bookings', { body });
+    console.log(`${label} →`, r.status, r.body?.error);
+    assert.equal(r.status, 400, label);
+  }
+  const { booking } = await must('POST', '/bookings', { body: { event_id: event.id, quantity: 1, email: `  ${who.email.toUpperCase()} `, name: ` ${who.name} ` } });
+  console.log('booked with messy email/name →', { email: booking.email, name: booking.name, status: booking.status });
+  assert.equal(booking.email, who.email, 'email is trimmed and lowercased');
+  assert.equal(booking.name, who.name, 'name is trimmed');
+  const mine = (await must('GET', `/bookings?email=${encodeURIComponent(who.email.toUpperCase())}`)).bookings;
+  console.log('GET /bookings?email= (upper-cased query) →', mine.map((b) => b.id));
+  assert.deepEqual(mine.map((b) => b.id), [booking.id]);
+  const noEmail = await api('GET', '/bookings');
+  assert.equal(noEmail.status, 400, 'GET /bookings requires ?email=');
+}
 
-  const burst = await Promise.all(Array.from({ length: 20 }, () => post(token, key, body)));
+async function idempotency() {
+  const who = newCustomer('idem');
+  const event = await newEvent(5);
+  const key = crypto.randomUUID();
+  const body = { event_id: event.id, quantity: 2, ...who };
+
+  const burst = await Promise.all(Array.from({ length: 20 }, () => post(key, body)));
   const ids = new Set(burst.map((r) => r.body.booking?.id));
   console.log('20 concurrent same-key requests →', { statuses: burst.map((r) => r.status).join(','), distinct_booking_ids: ids.size });
   assert.equal(ids.size, 1, 'same key must yield one booking');
@@ -54,27 +81,25 @@ async function idempotency() {
   assert.equal(ev.available + ev.held + ev.sold, 5);
   assert.equal(5 - ev.available, 2, 'seats must be held once, not 20 times');
 
-  const replay = await post(token, key, body);
+  const replay = await post(key, body);
   console.log('sequential replay →', { status: replay.status, replayed: replay.replayed, same_id: replay.body.booking.id === [...ids][0] });
   assert.equal(replay.status, 200);
   assert.equal(replay.replayed, 'true');
 
-  const reused = await post(token, key, { event_id: event.id, quantity: 1 });
+  const reused = await post(key, { ...body, quantity: 1 });
   console.log('same key, different body →', reused.status, reused.body.error);
   assert.equal(reused.status, 422);
 
-  const other = await newUser('idem2');
-  const otherRes = await post(other.token, key, body);
-  console.log('same key, other user →', { status: otherRes.status, independent: otherRes.body.booking?.id !== [...ids][0] });
+  const otherRes = await post(key, { ...body, ...newCustomer('idem2') });
+  console.log('same key, other customer email →', { status: otherRes.status, independent: otherRes.body.booking?.id !== [...ids][0] });
   assert.equal(otherRes.status, 202);
   assert.notEqual(otherRes.body.booking.id, [...ids][0]);
 }
 
 // Needs payment slower than the hold (task check sets HOLD_TTL=5s, payment 8–10s, success 100%).
 async function refund() {
-  const { token } = await newUser('refund');
-  const event = await newEvent(token, 3);
-  const { booking } = await must('POST', '/bookings', { token, body: { event_id: event.id, quantity: 1 } });
+  const event = await newEvent(3);
+  const { booking } = await must('POST', '/bookings', { body: { event_id: event.id, quantity: 1, ...newCustomer('refund') } });
   console.log('booked', booking.id, booking.status);
 
   const expired = await until('EXPIRED', async () => {
@@ -96,10 +121,10 @@ async function refund() {
 
 // Needs payment to finish inside the hold (task check sets HOLD_TTL=60s, payment 6–8s, success 100%).
 async function redisLoss() {
-  const { token } = await newUser('redis');
-  const event = await newEvent(token, 10);
+  const who = newCustomer('redis');
+  const event = await newEvent(10);
   const bookings = await Promise.all(
-    [1, 2, 3].map(async () => (await must('POST', '/bookings', { token, body: { event_id: event.id, quantity: 1 } })).booking),
+    [1, 2, 3].map(async () => (await must('POST', '/bookings', { body: { event_id: event.id, quantity: 1, ...who } })).booking),
   );
   console.log('3 bookings PENDING, seats →', pick(await eventNow(event.id)));
 

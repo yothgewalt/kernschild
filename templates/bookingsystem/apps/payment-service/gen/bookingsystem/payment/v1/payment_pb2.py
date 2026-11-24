@@ -24,25 +24,25 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n&bookingsystem/payment/v1/payment.proto\x12\x18\x62ookingsystem.payment.v1\"\xf3\x01\n\x07Payment\x12\x0e\n\x02id\x18\x01 \x01(\tR\x02id\x12\x1d\n\nbooking_id\x18\x02 \x01(\tR\tbookingId\x12\x17\n\x07user_id\x18\x03 \x01(\tR\x06userId\x12!\n\x0c\x61mount_cents\x18\x04 \x01(\x03R\x0b\x61mountCents\x12?\n\x06status\x18\x05 \x01(\x0e\x32\'.bookingsystem.payment.v1.PaymentStatusR\x06status\x12\x1d\n\ncreated_at\x18\x06 \x01(\tR\tcreatedAt\x12\x1d\n\nupdated_at\x18\x07 \x01(\tR\tupdatedAt\"2\n\x11GetPaymentRequest\x12\x1d\n\nbooking_id\x18\x01 \x01(\tR\tbookingId\"Q\n\x12GetPaymentResponse\x12;\n\x07payment\x18\x01 \x01(\x0b\x32!.bookingsystem.payment.v1.PaymentR\x07payment\"+\n\x13ListPaymentsRequest\x12\x14\n\x05limit\x18\x01 \x01(\x05R\x05limit\"U\n\x14ListPaymentsResponse\x12=\n\x08payments\x18\x01 \x03(\x0b\x32!.bookingsystem.payment.v1.PaymentR\x08payments*\xa4\x01\n\rPaymentStatus\x12\x1e\n\x1aPAYMENT_STATUS_UNSPECIFIED\x10\x00\x12\x1d\n\x19PAYMENT_STATUS_PROCESSING\x10\x01\x12\x1c\n\x18PAYMENT_STATUS_SUCCEEDED\x10\x02\x12\x19\n\x15PAYMENT_STATUS_FAILED\x10\x03\x12\x1b\n\x17PAYMENT_STATUS_REFUNDED\x10\x04\x32\xe8\x01\n\x0ePaymentService\x12g\n\nGetPayment\x12+.bookingsystem.payment.v1.GetPaymentRequest\x1a,.bookingsystem.payment.v1.GetPaymentResponse\x12m\n\x0cListPayments\x12-.bookingsystem.payment.v1.ListPaymentsRequest\x1a..bookingsystem.payment.v1.ListPaymentsResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n&bookingsystem/payment/v1/payment.proto\x12\x18\x62ookingsystem.payment.v1\"\xf0\x01\n\x07Payment\x12\x0e\n\x02id\x18\x01 \x01(\tR\x02id\x12\x1d\n\nbooking_id\x18\x02 \x01(\tR\tbookingId\x12\x14\n\x05\x65mail\x18\x03 \x01(\tR\x05\x65mail\x12!\n\x0c\x61mount_cents\x18\x04 \x01(\x03R\x0b\x61mountCents\x12?\n\x06status\x18\x05 \x01(\x0e\x32\'.bookingsystem.payment.v1.PaymentStatusR\x06status\x12\x1d\n\ncreated_at\x18\x06 \x01(\tR\tcreatedAt\x12\x1d\n\nupdated_at\x18\x07 \x01(\tR\tupdatedAt\"2\n\x11GetPaymentRequest\x12\x1d\n\nbooking_id\x18\x01 \x01(\tR\tbookingId\"Q\n\x12GetPaymentResponse\x12;\n\x07payment\x18\x01 \x01(\x0b\x32!.bookingsystem.payment.v1.PaymentR\x07payment\"+\n\x13ListPaymentsRequest\x12\x14\n\x05limit\x18\x01 \x01(\x05R\x05limit\"U\n\x14ListPaymentsResponse\x12=\n\x08payments\x18\x01 \x03(\x0b\x32!.bookingsystem.payment.v1.PaymentR\x08payments*\xa4\x01\n\rPaymentStatus\x12\x1e\n\x1aPAYMENT_STATUS_UNSPECIFIED\x10\x00\x12\x1d\n\x19PAYMENT_STATUS_PROCESSING\x10\x01\x12\x1c\n\x18PAYMENT_STATUS_SUCCEEDED\x10\x02\x12\x19\n\x15PAYMENT_STATUS_FAILED\x10\x03\x12\x1b\n\x17PAYMENT_STATUS_REFUNDED\x10\x04\x32\xe8\x01\n\x0ePaymentService\x12g\n\nGetPayment\x12+.bookingsystem.payment.v1.GetPaymentRequest\x1a,.bookingsystem.payment.v1.GetPaymentResponse\x12m\n\x0cListPayments\x12-.bookingsystem.payment.v1.ListPaymentsRequest\x1a..bookingsystem.payment.v1.ListPaymentsResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'bookingsystem.payment.v1.payment_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_PAYMENTSTATUS']._serialized_start=582
-  _globals['_PAYMENTSTATUS']._serialized_end=746
+  _globals['_PAYMENTSTATUS']._serialized_start=579
+  _globals['_PAYMENTSTATUS']._serialized_end=743
   _globals['_PAYMENT']._serialized_start=69
-  _globals['_PAYMENT']._serialized_end=312
-  _globals['_GETPAYMENTREQUEST']._serialized_start=314
-  _globals['_GETPAYMENTREQUEST']._serialized_end=364
-  _globals['_GETPAYMENTRESPONSE']._serialized_start=366
-  _globals['_GETPAYMENTRESPONSE']._serialized_end=447
-  _globals['_LISTPAYMENTSREQUEST']._serialized_start=449
-  _globals['_LISTPAYMENTSREQUEST']._serialized_end=492
-  _globals['_LISTPAYMENTSRESPONSE']._serialized_start=494
-  _globals['_LISTPAYMENTSRESPONSE']._serialized_end=579
-  _globals['_PAYMENTSERVICE']._serialized_start=749
-  _globals['_PAYMENTSERVICE']._serialized_end=981
+  _globals['_PAYMENT']._serialized_end=309
+  _globals['_GETPAYMENTREQUEST']._serialized_start=311
+  _globals['_GETPAYMENTREQUEST']._serialized_end=361
+  _globals['_GETPAYMENTRESPONSE']._serialized_start=363
+  _globals['_GETPAYMENTRESPONSE']._serialized_end=444
+  _globals['_LISTPAYMENTSREQUEST']._serialized_start=446
+  _globals['_LISTPAYMENTSREQUEST']._serialized_end=489
+  _globals['_LISTPAYMENTSRESPONSE']._serialized_start=491
+  _globals['_LISTPAYMENTSRESPONSE']._serialized_end=576
+  _globals['_PAYMENTSERVICE']._serialized_start=746
+  _globals['_PAYMENTSERVICE']._serialized_end=978
 # @@protoc_insertion_point(module_scope)

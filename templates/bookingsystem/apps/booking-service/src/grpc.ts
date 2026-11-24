@@ -2,10 +2,8 @@ import grpc from '@grpc/grpc-js';
 import protoLoader from '@grpc/proto-loader';
 import type { MethodDefinition } from '@grpc/proto-loader';
 import type { status as GrpcStatus } from '@grpc/grpc-js';
-import type { ProtoGrpcType as AuthProto } from './gen/auth.ts';
 import type { ProtoGrpcType as EventProto } from './gen/event.ts';
 import type { ProtoGrpcType as PaymentProto } from './gen/payment.ts';
-import type { AuthServiceDefinition } from './gen/bookingsystem/auth/v1/AuthService.ts';
 import type { EventServiceDefinition } from './gen/bookingsystem/event/v1/EventService.ts';
 import type { PaymentServiceDefinition } from './gen/bookingsystem/payment/v1/PaymentService.ts';
 import type { config } from './config.ts';
@@ -27,7 +25,6 @@ type Rpc<D, K extends keyof D> =
 type Rpcs<D, K extends keyof D> = { [M in K]: Rpc<D, M> };
 
 export interface Clients {
-  auth: Rpcs<AuthServiceDefinition, 'Register' | 'Login' | 'ValidateToken'>;
   event: Rpcs<EventServiceDefinition, 'CreateEvent' | 'GetEvent' | 'ListEvents' | 'ReserveSeats' | 'ConfirmSeats' | 'ReleaseSeats'>;
   payment: Rpcs<PaymentServiceDefinition, 'GetPayment' | 'ListPayments'>;
 }
@@ -45,20 +42,14 @@ function unary<Res>(start: (options: grpc.CallOptions, cb: grpc.requestCallback<
 
 // Each method is (req) => Promise<res>. Errors keep grpc `.code`.
 export function createClients(cfg: typeof config): Clients {
-  const files = ['auth', 'event', 'payment'].map((name) => `${cfg.protoDir}/bookingsystem/${name}/v1/${name}.proto`);
+  const files = ['event', 'payment'].map((name) => `${cfg.protoDir}/bookingsystem/${name}/v1/${name}.proto`);
   // The one cast: loadPackageDefinition is untyped; the generated types describe what it loaded.
-  const { auth, event, payment } = (grpc.loadPackageDefinition(protoLoader.loadSync(files, opts)) as unknown as
-    AuthProto & EventProto & PaymentProto).bookingsystem;
+  const { event, payment } = (grpc.loadPackageDefinition(protoLoader.loadSync(files, opts)) as unknown as
+    EventProto & PaymentProto).bookingsystem;
   const insecure = () => grpc.credentials.createInsecure();
-  const a = new auth.v1.AuthService(cfg.authAddr, insecure(), channelOpts);
   const e = new event.v1.EventService(cfg.eventAddr, insecure(), channelOpts);
   const p = new payment.v1.PaymentService(cfg.paymentAddr, insecure(), channelOpts);
   return {
-    auth: {
-      Register: (req) => unary((o, cb) => a.Register(req, o, cb)),
-      Login: (req) => unary((o, cb) => a.Login(req, o, cb)),
-      ValidateToken: (req) => unary((o, cb) => a.ValidateToken(req, o, cb)),
-    },
     event: {
       CreateEvent: (req) => unary((o, cb) => e.CreateEvent(req, o, cb)),
       GetEvent: (req) => unary((o, cb) => e.GetEvent(req, o, cb)),
