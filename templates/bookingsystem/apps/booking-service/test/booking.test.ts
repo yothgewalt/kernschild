@@ -10,7 +10,14 @@ import { buildApp } from '../src/app.ts';
 import { code } from '../src/grpc.ts';
 import type { Clients, GrpcStatus } from '../src/grpc.ts';
 import type { Hold__Output } from '../src/gen/bookingsystem/event/v1/Hold.ts';
-import type { Outbox } from '../src/types.ts';
+import type { Booking, Outbox } from '../src/types.ts';
+
+// The fields the tests read from a response body. JSON turns the booking's Dates into strings.
+interface Body {
+  booking: { [K in keyof Booking]: Booking[K] extends Date ? string : Booking[K] };
+  error: string;
+  events: { price_cents: number }[];
+}
 
 const ADMIN = 'postgres://postgres:postgres@localhost:5432/postgres';
 const URL = 'postgres://postgres:postgres@localhost:5432/booking_test';
@@ -58,7 +65,7 @@ beforeEach(async () => {
       Login: rec('Login', unexpected),
       ValidateToken: rec('ValidateToken', ({ token }) => {
         const users: Record<string, string> = { good: 'u1', good2: 'u2' };
-        const user_id = token === undefined ? undefined : users[token];
+        const user_id = users[token];
         if (!user_id) throw rpcErr(code.UNAUTHENTICATED, 'bad token');
         return { user_id, email: 'a@b.c' };
       }),
@@ -82,7 +89,7 @@ const post = (payload: object, token: string | null = 'good', key?: string) => a
   method: 'POST', url: '/bookings', payload,
   headers: { ...(token && { authorization: `Bearer ${token}` }), ...(key !== undefined && { 'idempotency-key': key }) },
 });
-const create = async () => (await post({ event_id: EVENT, quantity: 2 })).json().booking;
+const create = async () => (await post({ event_id: EVENT, quantity: 2 })).json<Body>().booking;
 const result = (b: { id: string }, status: string) => bookings.onResult({ booking_id: b.id, payment_id: '22222222-2222-4222-8222-222222222222', status, amount_cents: 300000 });
 const status = async (id: string) => (await db.get(id))?.status;
 const PAY = '22222222-2222-4222-8222-222222222222';
@@ -90,7 +97,7 @@ const refunds = () => published.filter(([k]) => k === 'payment.refund.requested'
 const keyed = (key: string, token = 'good', quantity = 2) => post({ event_id: EVENT, quantity }, token, key);
 const bookingCount = async () => {
   const p = new pg.Client(URL); await p.connect();
-  const n = (await p.query('SELECT count(*)::int n FROM bookings')).rows[0].n; await p.end();
+  const n = (await p.query<{ n: number }>('SELECT count(*)::int n FROM bookings')).rows[0]?.n; await p.end();
   return n;
 };
 
@@ -98,7 +105,7 @@ test('sold out -> 409 sold_out', async () => {
   behavior.ReserveSeats = () => { throw rpcErr(code.RESOURCE_EXHAUSTED); };
   const r = await post({ event_id: EVENT, quantity: 2 });
   assert.equal(r.statusCode, 409);
-  assert.equal(r.json().error, 'sold_out');
+  assert.equal(r.json<Body>().error, 'sold_out');
 });
 
 test('missing or invalid token -> 401, even with an invalid body', async () => {
@@ -110,7 +117,7 @@ test('missing or invalid token -> 401, even with an invalid body', async () => {
 test('POST /bookings -> 202 PENDING and publishes payment.requested', async () => {
   const r = await post({ event_id: EVENT, quantity: 2 });
   assert.equal(r.statusCode, 202);
-  const b = r.json().booking;
+  const b = r.json<Body>().booking;
   assert.equal(b.status, 'PENDING');
   assert.equal(b.amount_cents, 300000);
   assert.deepEqual(published, [['payment.requested', { booking_id: b.id, user_id: 'u1', event_id: EVENT, amount_cents: 300000 }]]);
@@ -128,7 +135,7 @@ test('publish failure releases seats and marks FAILED', async () => {
 test('SUCCEEDED -> CONFIRMED with payment_id', async () => {
   const b = await create();
   assert.equal(await result(b, 'SUCCEEDED'), 'ack');
-  const got = (await app.inject(`/bookings/${b.id}`)).json().booking;
+  const got = (await app.inject(`/bookings/${b.id}`)).json<Body>().booking;
   assert.equal(got?.status, 'CONFIRMED');
   assert.equal(got?.payment_id, '22222222-2222-4222-8222-222222222222');
 });
@@ -173,7 +180,7 @@ test('sweeper expires overdue PENDING bookings and releases', async () => {
 });
 
 test('GET /events renders int64 as number', async () => {
-  assert.equal((await app.inject('/events')).json().events[0].price_cents, 150000);
+  assert.equal((await app.inject('/events')).json<Body>().events[0]?.price_cents, 150000);
 });
 
 test('SUCCEEDED + FAILED_PRECONDITION -> EXPIRED and refund hold_expired', async () => {
@@ -227,27 +234,27 @@ test('same Idempotency-Key and body twice -> same booking, second is a 200 repla
   const r2 = await keyed('k1');
   assert.equal(r2.statusCode, 200);
   assert.equal(r2.headers['idempotent-replayed'], 'true');
-  assert.equal(r2.json().booking.id, r1.json().booking.id);
+  assert.equal(r2.json<Body>().booking.id, r1.json<Body>().booking.id);
   const reserves = calls.filter(([n]) => n === 'ReserveSeats');
   assert.equal(reserves.length, 1);
-  assert.equal(bookingIdOf(reserves[0]?.[1]), r1.json().booking.id);
+  assert.equal(bookingIdOf(reserves[0]?.[1]), r1.json<Body>().booking.id);
   // still PENDING, so the replay re-publishes payment.requested for the same booking
-  assert.deepEqual(published.map(([k, body]) => [k, body.booking_id]), [['payment.requested', r1.json().booking.id], ['payment.requested', r1.json().booking.id]]);
+  assert.deepEqual(published.map(([k, body]) => [k, body.booking_id]), [['payment.requested', r1.json<Body>().booking.id], ['payment.requested', r1.json<Body>().booking.id]]);
 });
 
 test('replay of a non-PENDING booking does not re-publish', async () => {
   const r1 = await keyed('k1');
-  await result(r1.json().booking, 'SUCCEEDED');
+  await result(r1.json<Body>().booking, 'SUCCEEDED');
   published.length = 0;
   const r2 = await keyed('k1');
   assert.equal(r2.statusCode, 200);
-  assert.equal(r2.json().booking.status, 'CONFIRMED');
+  assert.equal(r2.json<Body>().booking.status, 'CONFIRMED');
   assert.deepEqual(published, []);
 });
 
 test('20 concurrent same-key requests converge on one booking', async () => {
   const rs = await Promise.all(Array.from({ length: 20 }, () => keyed('same')));
-  const ids = new Set(rs.map((r) => r.json().booking.id));
+  const ids = new Set<unknown>(rs.map((r) => r.json<Body>().booking.id));
   assert.ok(rs.every((r) => r.statusCode === 202 || r.statusCode === 200), rs.map((r) => r.statusCode).join());
   assert.equal(ids.size, 1);
   assert.equal(await bookingCount(), 1);
@@ -258,7 +265,7 @@ test('same key with a different body -> 422 idempotency_key_reused', async () =>
   assert.equal((await keyed('k1', 'good', 2)).statusCode, 202);
   const r = await keyed('k1', 'good', 3);
   assert.equal(r.statusCode, 422);
-  assert.equal(r.json().error, 'idempotency_key_reused');
+  assert.equal(r.json<Body>().error, 'idempotency_key_reused');
   assert.equal(await bookingCount(), 1);
 });
 
@@ -267,15 +274,15 @@ test('same key from a different user -> independent bookings', async () => {
   const b = await keyed('k1', 'good2');
   assert.equal(a.statusCode, 202);
   assert.equal(b.statusCode, 202);
-  assert.notEqual(a.json().booking.id, b.json().booking.id);
-  assert.equal(b.json().booking.user_id, 'u2');
+  assert.notEqual(a.json<Body>().booking.id, b.json<Body>().booking.id);
+  assert.equal(b.json<Body>().booking.user_id, 'u2');
 });
 
 test('bad Idempotency-Key -> 400 invalid_idempotency_key', async () => {
   for (const key of ['', 'x'.repeat(201)]) {
     const r = await keyed(key);
     assert.equal(r.statusCode, 400, JSON.stringify(key));
-    assert.equal(r.json().error, 'invalid_idempotency_key');
+    assert.equal(r.json<Body>().error, 'invalid_idempotency_key');
   }
   assert.equal((await keyed('x'.repeat(200))).statusCode, 202);
   assert.equal(calls.filter(([n]) => n === 'ReserveSeats').length, 1);
@@ -289,7 +296,7 @@ test('key after a 409 sold out -> retry succeeds once seats exist', async () => 
   delete behavior.ReserveSeats;
   const r2 = await keyed('k1');
   assert.equal(r2.statusCode, 202);
-  assert.equal(r2.json().booking.status, 'PENDING');
+  assert.equal(r2.json<Body>().booking.status, 'PENDING');
 });
 
 test('sweeper deletes idempotency keys older than 24h, at most once a minute', async () => {
@@ -297,7 +304,7 @@ test('sweeper deletes idempotency keys older than 24h, at most once a minute', a
   const p = new pg.Client(URL); await p.connect();
   await p.query(`UPDATE idempotency_keys SET created_at = now() - interval '25 hours' WHERE key='old'`);
   await bookings.sweep();
-  const keys = async () => (await p.query('SELECT key FROM idempotency_keys ORDER BY key')).rows.map((r) => r.key);
+  const keys = async () => (await p.query<{ key: string }>('SELECT key FROM idempotency_keys ORDER BY key')).rows.map((r) => r.key);
   assert.deepEqual(await keys(), ['new']);
   await p.query(`UPDATE idempotency_keys SET created_at = now() - interval '25 hours'`);
   await bookings.sweep(); // within the minute: skipped
@@ -354,13 +361,13 @@ test('keyed retry after the hold was released -> fresh booking on a live hold', 
   assert.equal(r1.statusCode, 500);
   const r2 = await keyed('k1');
   assert.equal(r2.statusCode, 202);
-  const b = r2.json().booking;
+  const b = r2.json<Body>().booking;
   assert.equal(b.status, 'PENDING');
   assert.equal(holds.get(b.id)?.status, 'HOLD_STATUS_HELD');
   assert.equal(await bookingCount(), 1);
   const r3 = await keyed('k1');
   assert.equal(r3.statusCode, 200);
-  assert.equal(r3.json().booking.id, b.id);
+  assert.equal(r3.json<Body>().booking.id, b.id);
 });
 
 test('keyed retry after the hold expired but before the event sweeper -> fresh booking', async () => {
@@ -369,7 +376,7 @@ test('keyed retry after the hold expired but before the event sweeper -> fresh b
     expires_at: new Date(Date.now() + (n++ === 0 ? -1000 : 60000)).toISOString() } });
   const r = await keyed('k1');
   assert.equal(r.statusCode, 202);
-  assert.ok(Date.parse(r.json().booking.expires_at) > Date.now());
+  assert.ok(Date.parse(r.json<Body>().booking.expires_at) > Date.now());
 });
 
 test('database or INTERNAL error while handling a result -> requeue, not drop', async () => {
@@ -384,3 +391,25 @@ test('database or INTERNAL error while handling a result -> requeue, not drop', 
   assert.equal(await result(b, 'SUCCEEDED'), 'ack');
   assert.equal(await status(b.id), 'CONFIRMED');
 });
+
+test('result with a non-uuid id is dropped before any side effect', async () => {
+  const b = await create();
+  await assert.rejects(bookings.onResult({ booking_id: 'not-a-uuid', payment_id: PAY, status: 'FAILED' }), /bad result message/);
+  await assert.rejects(bookings.onResult({ booking_id: b.id, payment_id: 'not-a-uuid', status: 'SUCCEEDED' }), /bad result message/);
+  assert.ok(!calls.some(([n]) => n === 'ConfirmSeats' || n === 'ReleaseSeats'));
+  assert.equal(await status(b.id), 'PENDING');
+});
+
+test('booking row gone during confirm -> requeue, no refund', async () => {
+  const b = await create();
+  behavior.ConfirmSeats = async () => {
+    const p = new pg.Client(URL); await p.connect(); await p.query('DELETE FROM bookings WHERE id=$1', [b.id]); await p.end();
+    return { hold: null };
+  };
+  assert.equal(await result(b, 'SUCCEEDED'), 'requeue');
+  assert.deepEqual(refunds(), []);
+});
+
+// An RPC request must name every field: proto3 would send a missing one as '' or 0.
+// @ts-expect-error booking_id is missing
+const _missingField = (c: Clients) => c.event.ConfirmSeats({});

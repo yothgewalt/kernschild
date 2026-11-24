@@ -21,6 +21,7 @@ tasks:
       - for: [auth-service, event-service, payment-service]
         cmd: cd apps/{{.ITEM}} && buf generate
       - rm -rf apps/booking-service/proto && buf export proto --output apps/booking-service/proto
+      - cd apps/booking-service && rm -rf src/gen && npx --no proto-loader-gen-types --keepCase --longs=String --enums=String --defaults --grpcLib=@grpc/grpc-js --importFileExtension=.ts -O src/gen proto/bookingsystem/*/v1/*.proto
 
   tidy:
     desc: Install/refresh local dependencies for all services
@@ -45,6 +46,7 @@ tasks:
       - for: [auth-service, event-service]
         cmd: cd apps/{{.ITEM}} && go vet ./... && go test -race -count=1 ./...
       - npm ci --prefix apps/booking-service --no-audit --no-fund
+      - npm run typecheck --prefix apps/booking-service
       - npm test --prefix apps/booking-service
       - uv run --directory apps/payment-service pytest -q
 

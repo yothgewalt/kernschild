@@ -84,7 +84,7 @@ export function createBookings({ db, grpc, mq }: { db: Db; grpc: Clients; mq: Pi
           return 'ack';
         };
         // SUCCEEDED on a booking that is no longer PENDING: CONFIRMED is a duplicate, anything else is refunded.
-        const notPending = async (status: BookingStatus | undefined): Promise<Verdict> => {
+        const notPending = async (status: BookingStatus): Promise<Verdict> => {
           if (status === 'CONFIRMED') return 'ack';
           await db.setPaymentIdIfNull(b.id, msg.payment_id);
           return refund('booking_not_pending');
@@ -107,7 +107,9 @@ export function createBookings({ db, grpc, mq }: { db: Db; grpc: Clients; mq: Pi
         if (await db.transition(b.id, 'CONFIRMED', msg.payment_id)) { log('booking confirmed', b.id); return 'ack'; }
         // A duplicate confirmed it first (the sweeper never expires a booking whose hold is CONFIRMED).
         log('booking left PENDING during confirm', b.id);
-        return notPending((await db.get(b.id))?.status);
+        const now = await db.get(b.id);
+        if (!now) throw new Error('booking vanished during confirm'); // requeue; the retry acks it as unknown
+        return notPending(now.status);
       } catch (e) {
         log('result handling failed, requeue', msg.booking_id, errorMessage(e));
         return 'requeue';

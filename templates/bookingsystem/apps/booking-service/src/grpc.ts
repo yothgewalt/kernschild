@@ -20,9 +20,10 @@ const channelOpts = {
   'grpc.max_reconnect_backoff_ms': 2000,
 };
 
-// The promise form of one unary RPC, typed from the generated service definition.
+// The promise form of one unary RPC, typed from the generated service definition. Every request
+// field is required: proto3 would send a missing one as its default ('' or 0) without complaint.
 type Rpc<D, K extends keyof D> =
-  D[K] extends MethodDefinition<infer Req, infer _Res, infer _ReqOut, infer Res> ? (req: Req) => Promise<Res> : never;
+  D[K] extends MethodDefinition<infer Req, infer _Res, infer _ReqOut, infer Res> ? (req: Required<Req>) => Promise<Res> : never;
 type Rpcs<D, K extends keyof D> = { [M in K]: Rpc<D, M> };
 
 export interface Clients {

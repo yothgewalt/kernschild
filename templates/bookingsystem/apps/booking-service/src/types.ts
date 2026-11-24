@@ -33,10 +33,14 @@ export interface PaymentResult {
   status: 'SUCCEEDED' | 'FAILED';
 }
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isUuid = (x: unknown): x is string => typeof x === 'string' && UUID.test(x);
+
+// Both ids land in uuid columns: a non-uuid one would make pg throw and the message requeue forever.
 export function isPaymentResult(x: unknown): x is PaymentResult {
   return typeof x === 'object' && x !== null
-    && 'booking_id' in x && typeof x.booking_id === 'string'
-    && 'payment_id' in x && typeof x.payment_id === 'string'
+    && 'booking_id' in x && isUuid(x.booking_id)
+    && 'payment_id' in x && isUuid(x.payment_id)
     && 'status' in x && (x.status === 'SUCCEEDED' || x.status === 'FAILED');
 }
 
