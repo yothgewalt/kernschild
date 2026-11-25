@@ -1,4 +1,4 @@
-FROM node:26.12.0-alpine3.23
+FROM node:26-alpine
 ENV NODE_ENV=production
 WORKDIR /app
 COPY package*.json ./
